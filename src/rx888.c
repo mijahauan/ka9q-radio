@@ -559,6 +559,11 @@ static void rx_callback(struct libusb_transfer * const transfer){
   int const size = transfer->actual_length;
   sdr->success_count++;
 
+  // On first successful transfer, record GPS time for sample 0
+  // This allows precise computation of GPS time for any sample index
+  if(frontend->samples == 0)
+    frontend->gps_time_at_sample_zero = now;
+
   // Feed directly into FFT input buffer, accumulate energy
   double in_energy = 0; // A/D energy accumulator
   int16_t const * const restrict samples = (int16_t *)transfer->buffer;

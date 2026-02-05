@@ -1166,6 +1166,9 @@ static void rx_callback(int16_t *xi,int16_t *xq,sdrplay_api_StreamCbParamsT *par
     in_energy += cnrm(samp);
     wptr[i] = (float complex)(samp * sdr->scale);
   }
+  // On first callback, record GPS time for sample 0
+  if(frontend->samples == 0)
+    frontend->gps_time_at_sample_zero = gps_time_ns();
   frontend->samples += sampcount;
   write_cfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT
   if(isfinite(in_energy)){

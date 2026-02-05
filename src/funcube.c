@@ -282,6 +282,9 @@ static void *proc_funcube(void *arg){
 
       wptr[i] = (float complex)(samp * sdr->scale);
     }
+    // On first callback, record GPS time for sample 0
+    if(frontend->samples == 0)
+      frontend->gps_time_at_sample_zero = gps_time_ns();
     write_cfilter(&frontend->in,NULL,Blocksize); // Update write pointer, invoke FFT
     frontend->samples += Blocksize;
     double const block_energy = i_energy + q_energy; // Normalize for complex pairs

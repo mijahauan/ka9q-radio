@@ -231,6 +231,9 @@ static void bladerf_process(struct frontend * const frontend,
 
 	frontend->if_power += Power_alpha * (energy / num_samples -
 			frontend->if_power);
+	// On first callback, record GPS time for sample 0
+	if(frontend->samples == 0)
+		frontend->gps_time_at_sample_zero = gps_time_ns();
 	frontend->samples += num_samples;
 
 	// Update write pointer, invoke FFT

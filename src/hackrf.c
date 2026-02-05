@@ -327,6 +327,9 @@ static int rx_callback(hackrf_transfer *transfer){
 
   // These blocks are kinda small, so exponentially smooth the power readings
   frontend->if_power += sampcount * rate_factor * (block_energy/sampcount - frontend->if_power);
+  // On first callback, record GPS time for sample 0
+  if(frontend->samples == 0)
+    frontend->gps_time_at_sample_zero = gps_time_ns();
   frontend->samples += sampcount; // Count original samples
   if(block_energy > 0){ // Avoid divisions by 0, etc
     sdr->imbalance += rate_factor * sampcount * ((i_energy / q_energy) - sdr->imbalance);

@@ -679,9 +679,13 @@ static unsigned long encode_radio_status(struct frontend const *frontend,struct 
     encode_string(&bp,DESCRIPTION,frontend->description,strlen(frontend->description));
 
   encode_socket(&bp,STATUS_DEST_SOCKET,&chan->frontend->metadata_dest_socket);
-  int64_t now = gps_time_ns();
-  encode_int64(&bp,GPS_TIME,now);
-  encode_int64(&bp,INPUT_SAMPLES,chan->filter.out.sample_index);
+  // Compute GPS_TIME corresponding to the current sample_index, not wall clock time
+  // This ensures GPS_TIME and INPUT_SAMPLES refer to the same instant
+  uint64_t sample_index = chan->filter.out.sample_index;
+  int64_t gps_time_for_sample = frontend->gps_time_at_sample_zero
+    + (int64_t)(sample_index * BILLION / frontend->samprate);
+  encode_int64(&bp,GPS_TIME,gps_time_for_sample);
+  encode_int64(&bp,INPUT_SAMPLES,sample_index);
   encode_int32(&bp,INPUT_SAMPRATE,(uint32_t)llrint(frontend->samprate)); // Already defined on the wire as integer Hz, shouldn't change now
   encode_bool(&bp,FE_ISREAL,frontend->isreal);
   encode_double(&bp,CALIBRATE,frontend->calibrate);

@@ -397,6 +397,9 @@ static int rx_callback(airspy_transfer *transfer){
     wptr += 8;
     up += 3;
   }
+  // On first callback, record GPS time for sample 0
+  if(frontend->samples == 0)
+    frontend->gps_time_at_sample_zero = gps_time_ns();
   frontend->samples += sampcount;
   write_rfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT
   frontend->if_power += Power_alpha * (in_energy / sampcount - frontend->if_power);

@@ -411,6 +411,9 @@ static void rx_callback(float *buf, uint32_t len, void *ctx) {
     in_energy += cnrm(samp);       // Calculate energy of the sample
     wptr[i] = (float complex)(samp * sdr->scale);    // Store sample in write pointer buffer
   }
+  // On first callback, record GPS time for sample 0
+  if(frontend->samples == 0)
+    frontend->gps_time_at_sample_zero = gps_time_ns();
   write_cfilter(&frontend->in, NULL,sampcount); // Update write pointer, invoke FFT
   frontend->samples += sampcount;
 
