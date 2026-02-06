@@ -559,10 +559,17 @@ static void rx_callback(struct libusb_transfer * const transfer){
   int const size = transfer->actual_length;
   sdr->success_count++;
 
-  // On first successful transfer, record GPS time for sample 0
-  // This allows precise computation of GPS time for any sample index
-  if(frontend->samples == 0)
-    frontend->gps_time_at_sample_zero = now;
+  // Update GPS time snapshot every second (at sample arrival time, not status generation)
+  // This captures the relationship between wall clock and sample count at the source
+  // Status packets use this to compute GPS_TIME for any sample_index
+  {
+    static int64_t last_update = 0;
+    if(last_update == 0 || (now - last_update) >= 1000000000LL) {
+      frontend->gps_time_snapshot = now;
+      frontend->samples_at_snapshot = frontend->samples;
+      last_update = now;
+    }
+  }
 
   // Feed directly into FFT input buffer, accumulate energy
   double in_energy = 0; // A/D energy accumulator

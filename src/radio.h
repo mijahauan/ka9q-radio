@@ -66,7 +66,9 @@ struct frontend {
   uint64_t samples;     // Count of raw I/Q samples received
   uint64_t overranges;  // Count of full scale A/D samples
   uint64_t samp_since_over; // Samples since last overrange
-  int64_t gps_time_at_sample_zero; // GPS time (ns) when samples counter was 0, for precise timing
+  // GPS time reference - captured at sample arrival, updated every second
+  int64_t gps_time_snapshot;      // GPS time (ns) when samples_at_snapshot was captured
+  uint64_t samples_at_snapshot;   // frontend->samples at snapshot time
 
   int M;            // Impulse length of input filter
   int L;            // Block length of input filter

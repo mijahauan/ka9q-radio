@@ -92,14 +92,16 @@ int demod_linear(void *arg){
     float complex * restrict const buffer = chan->baseband; // Working buffer
 
     if (!first_run && frontend->L != 0){
-      // Tie the RTP timestamps to radiod uptime
-      // ie, reference RTP timestamp 0 to the first radiod block
-      double const block_rate = frontend->samprate / frontend->L; // eg Fs 126 MHz * 20 ms = 2,520,000 samples
-      uint32_t const first_block = chan->filter.out.next_jobnum - 1; // radiod starts with jobnum 0
-      chan->output.rtp.timestamp = (int32_t)(first_block * (chan->output.samprate / block_rate));
-      if(Verbose > 0)
-	fprintf(stderr,"%s starting at FFT jobum %u, preset RTP TS to %u\n",chan->name,first_block,chan->output.rtp.timestamp);
+      // Initialize RTP timestamp from filter's input sample index
+      // This is the input sample index of the samples being output NOW,
+      // accounting for pipeline delay. All channels share the same time reference.
+      double const decimation = frontend->samprate / chan->output.samprate;
+      uint64_t input_sample_index = chan->filter.out.sample_index;
+      chan->output.rtp.timestamp = (uint32_t)(input_sample_index / decimation);
       first_run = true;
+      if(Verbose > 0)
+	fprintf(stderr,"%s starting, preset RTP TS to %u (from filter sample_index %llu)\n",
+                chan->name, chan->output.rtp.timestamp, (unsigned long long)input_sample_index);
     }
 
     // First pass over sample block.

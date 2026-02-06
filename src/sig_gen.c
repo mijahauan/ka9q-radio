@@ -284,9 +284,6 @@ static void *proc_sig_gen(void *arg){
       assert(r != -1);
       (void)r;
     }
-    // On first block, record GPS time for sample 0
-    if(frontend->samples == 0)
-      frontend->gps_time_at_sample_zero = gps_time_ns();
     frontend->samples += blocksize;
     // The variability in blocksize due to scheduling variability causes the energy integrated into frontend->if_power
     // to vary, causing the reported input level to bobble around the nominal value. Long refresh intervals with 'control'

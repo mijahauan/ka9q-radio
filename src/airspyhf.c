@@ -270,9 +270,6 @@ static int rx_callback(airspyhf_transfer_t *transfer){
     in_energy += cnrmf(s);
     wptr[i] = (float complex)(s * sdr->scale);
   }
-  // On first callback, record GPS time for sample 0
-  if(frontend->samples == 0)
-    frontend->gps_time_at_sample_zero = gps_time_ns();
   frontend->samples += sampcount;
   write_cfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT
   if(isfinite(in_energy)){

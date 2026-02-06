@@ -44,7 +44,7 @@ int send_output(struct channel * restrict const chan,float const * restrict buff
   if(mute){
     flush_output(chan,false,true);
 
-    // Still increment timestamp
+    // Still increment timestamp even when muted
     if(chan->output.encoding == OPUS)
       chan->output.rtp.timestamp += frames * OPUS_SAMPRATE / chan->output.samprate; // Opus always at 48 kHz
     else

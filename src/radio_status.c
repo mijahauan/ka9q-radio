@@ -679,13 +679,27 @@ static unsigned long encode_radio_status(struct frontend const *frontend,struct 
     encode_string(&bp,DESCRIPTION,frontend->description,strlen(frontend->description));
 
   encode_socket(&bp,STATUS_DEST_SOCKET,&chan->frontend->metadata_dest_socket);
-  // Compute GPS_TIME corresponding to the current sample_index, not wall clock time
-  // This ensures GPS_TIME and INPUT_SAMPLES refer to the same instant
-  uint64_t sample_index = chan->filter.out.sample_index;
-  int64_t gps_time_for_sample = frontend->gps_time_at_sample_zero
-    + (int64_t)(sample_index * BILLION / frontend->samprate);
-  encode_int64(&bp,GPS_TIME,gps_time_for_sample);
-  encode_int64(&bp,INPUT_SAMPLES,sample_index);
+  // GPS_TIME from frontend snapshot - SINGLE time reference shared by ALL channels
+  // RTP_TIMESNAP = snap_input / decimation (deterministic, same for all channels)
+  // All channels with same sample rate get IDENTICAL (GPS_TIME, RTP_TIMESNAP) pairs
+  // This provides a uniform time reference for sample alignment across channels
+  int64_t snap_gps = frontend->gps_time_snapshot;
+  uint64_t snap_input = frontend->samples_at_snapshot;
+  
+  int64_t gps_time_for_status;
+  uint32_t rtp_timesnap;
+  if(snap_gps != 0 && frontend->samprate > 0 && chan->output.samprate > 0) {
+    gps_time_for_status = snap_gps;
+    // Deterministic: RTP_TIMESNAP = input_samples_at_snapshot / decimation
+    double decimation = frontend->samprate / chan->output.samprate;
+    rtp_timesnap = (uint32_t)(snap_input / decimation);
+  } else {
+    gps_time_for_status = gps_time_ns();
+    rtp_timesnap = chan->output.rtp.timestamp;
+  }
+  encode_int64(&bp,GPS_TIME,gps_time_for_status);
+  encode_int32(&bp,RTP_TIMESNAP,rtp_timesnap);
+  encode_int64(&bp,INPUT_SAMPLES,chan->filter.out.sample_index);
   encode_int32(&bp,INPUT_SAMPRATE,(uint32_t)llrint(frontend->samprate)); // Already defined on the wire as integer Hz, shouldn't change now
   encode_bool(&bp,FE_ISREAL,frontend->isreal);
   encode_double(&bp,CALIBRATE,frontend->calibrate);
@@ -820,7 +834,7 @@ static unsigned long encode_radio_status(struct frontend const *frontend,struct 
   // Stuff not relevant in spectrum analysis mode
   if(chan->demod_type != SPECT_DEMOD && chan->demod_type != SPECT2_DEMOD){
     encode_bool(&bp,SNR_SQUELCH,chan->squelch.snr_enable);
-    encode_int32(&bp,RTP_TIMESNAP,chan->output.rtp.timestamp);
+    // RTP_TIMESNAP now encoded earlier with GPS_TIME for atomic capture
     encode_int64(&bp,OUTPUT_DATA_PACKETS,chan->output.rtp.packets);
     encode_int(&bp,FILTER2,chan->filter2.blocking);
     if(chan->filter2.blocking != 0){
