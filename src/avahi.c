@@ -22,6 +22,138 @@
 
 bool Static_avahi;
 
+#ifdef __APPLE__
+// macOS has no avahi; register with the system mDNSResponder through the
+// native dns_sd API instead of exec'ing the avahi CLI tools.
+// Registrations must stay active for the life of the process (like the
+// forked avahi-publish children on Linux), so each avahi_start() hands its
+// DNSServiceRefs to a detached thread running their event loop and nothing
+// is ever deallocated. The Static_avahi (/etc/avahi) mode doesn't apply here.
+#include <dns_sd.h>
+#include <pthread.h>
+#include <sys/select.h>
+#include <netinet/in.h>
+
+struct dnssd_session {
+  DNSServiceRef refs[2]; // service registration + connection holding the address record
+  int nrefs;
+};
+
+static void *dnssd_event_loop(void *arg){
+  struct dnssd_session * const sp = arg;
+  pthread_setname("dns-sd");
+  while(true){
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    int maxfd = -1;
+    for(int i = 0; i < sp->nrefs; i++){
+      int const fd = DNSServiceRefSockFD(sp->refs[i]);
+      FD_SET(fd,&rfds);
+      if(fd > maxfd)
+	maxfd = fd;
+    }
+    if(select(maxfd+1,&rfds,NULL,NULL,NULL) <= 0)
+      return NULL;
+    for(int i = 0; i < sp->nrefs; i++){
+      if(FD_ISSET(DNSServiceRefSockFD(sp->refs[i]),&rfds)
+	 && DNSServiceProcessResult(sp->refs[i]) != kDNSServiceErr_NoError)
+	return NULL;
+    }
+  }
+}
+
+static void dnssd_register_callback(DNSServiceRef sdref,DNSServiceFlags flags,DNSServiceErrorType error,
+				    char const *name,char const *regtype,char const *domain,void *context){
+  (void)sdref; (void)flags; (void)context;
+  if(error != kDNSServiceErr_NoError)
+    fprintf(stderr,"dns-sd registration of %s.%s%s failed: error %d\n",name,regtype,domain,(int)error);
+}
+
+static void dnssd_record_callback(DNSServiceRef sdref,DNSRecordRef rref,DNSServiceFlags flags,
+				  DNSServiceErrorType error,void *context){
+  (void)sdref; (void)rref; (void)flags;
+  if(error != kDNSServiceErr_NoError)
+    fprintf(stderr,"dns-sd address record for %s failed: error %d\n",(char *)context,(int)error);
+}
+
+// Append a string to a TXT record as a length-prefixed entry
+static int txt_append(uint8_t *txt,int len,int size,char const *s){
+  int const slen = strlen(s);
+  if(slen == 0 || slen > 255 || len + 1 + slen > size)
+    return len;
+  txt[len] = slen;
+  memcpy(txt + len + 1,s,slen);
+  return len + 1 + slen;
+}
+
+int avahi_start(char const *service_name,char const *service_type,int const service_port,char const *dns_name,int address,char const *description){
+  // Same TXT entries the Linux path passes to avahi-publish-service
+  uint8_t txt[512];
+  int txtlen = 0;
+  if(description != NULL)
+    txtlen = txt_append(txt,txtlen,sizeof(txt),description);
+  char tmp[256];
+  snprintf(tmp,sizeof(tmp),"pid=%d",getpid());
+  txtlen = txt_append(txt,txtlen,sizeof(txt),tmp);
+  char hostname[sysconf(_SC_HOST_NAME_MAX)];
+  gethostname(hostname,sizeof(hostname));
+  snprintf(tmp,sizeof(tmp),"source=%s",hostname);
+  txtlen = txt_append(txt,txtlen,sizeof(txt),tmp);
+
+  struct dnssd_session * const sp = calloc(1,sizeof(*sp));
+  DNSServiceErrorType err = DNSServiceRegister(&sp->refs[sp->nrefs],
+					       0, // default flags: rename on conflict
+					       kDNSServiceInterfaceIndexAny,
+					       service_name,
+					       service_type,
+					       NULL, // domain: local
+					       dns_name, // SRV target, like avahi-publish --host
+					       htons(service_port),
+					       txtlen,txt,
+					       dnssd_register_callback,NULL);
+  if(err != kDNSServiceErr_NoError)
+    fprintf(stderr,"DNSServiceRegister(%s,%s) failed: error %d\n",service_name,service_type,(int)err);
+  else
+    sp->nrefs++;
+
+  if(address != 0){
+    // Publish an address record mapping dns_name to the (multicast) address,
+    // like avahi-publish-address on Linux
+    DNSServiceRef conn = NULL;
+    err = DNSServiceCreateConnection(&conn);
+    if(err != kDNSServiceErr_NoError){
+      fprintf(stderr,"DNSServiceCreateConnection failed: error %d\n",(int)err);
+    } else {
+      uint32_t const addr_be = htonl((uint32_t)address);
+      DNSRecordRef rref = NULL;
+      err = DNSServiceRegisterRecord(conn,&rref,
+				     kDNSServiceFlagsUnique,
+				     kDNSServiceInterfaceIndexAny,
+				     dns_name,
+				     kDNSServiceType_A,
+				     kDNSServiceClass_IN,
+				     sizeof(addr_be),&addr_be,
+				     0, // default TTL
+				     dnssd_record_callback,strdup(dns_name));
+      if(err != kDNSServiceErr_NoError){
+	fprintf(stderr,"DNSServiceRegisterRecord(%s) failed: error %d\n",dns_name,(int)err);
+	DNSServiceRefDeallocate(conn);
+      } else
+	sp->refs[sp->nrefs++] = conn;
+    }
+  }
+  if(sp->nrefs == 0){
+    free(sp);
+    return -1;
+  }
+  pthread_t thread;
+  pthread_create(&thread,NULL,dnssd_event_loop,sp);
+  pthread_detach(thread);
+  return 0;
+}
+
+#else // !__APPLE__: fork/exec the avahi CLI tools, or write static /etc/avahi files
+
 int avahi_publish_address(char const *dns_name,char const *ip_address_string);
 int avahi_publish_service(char const *service_name, char const *service_type, char const *dns_name,int service_port, char const *description, int pid);
 static void sanitize_filename(char *name);
@@ -224,3 +356,4 @@ static void sanitize_filename(char *name) {
     dst--;
   *dst = '\0';
 }
+#endif // !__APPLE__

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd template for a radiod instance on macOS, the equivalent of
+     radiod@.service on Linux. @sbindir@ is filled in by 'make install';
+     @INSTANCE@ is filled in by the radiod-launchd script. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>net.ka9q.radiod.@INSTANCE@</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@sbindir@/radiod</string>
+		<string>-N</string>
+		<string>@INSTANCE@</string>
+		<string>/etc/radio/radiod@@INSTANCE@.conf</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Nice</key>
+	<integer>-10</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>WorkingDirectory</key>
+	<string>/var/lib/ka9q-radio</string>
+	<key>StandardOutPath</key>
+	<string>/var/log/ka9q-radio/radiod@@INSTANCE@.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/ka9q-radio/radiod@@INSTANCE@.log</string>
+</dict>
+</plist>

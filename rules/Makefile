@@ -15,6 +15,17 @@ all:
 clean:
 	@true
 
+ifeq ($(UNAME_S),Darwin)
+# udev is Linux-only; on macOS libusb claims USB devices directly
+install:
+	@true
+
+uninstall:
+	@true
+
+purge:
+	@true
+else
 install:
 	install -d -m 0755 $(DESTDIR)$(udevdir)
 	install -m 0644 $(RULES) $(DESTDIR)$(udevdir)
@@ -36,4 +47,5 @@ purge:
 	if [ -d "$(DESTDIR)$(udevdir)" ]; then \
 		cd $(DESTDIR)$(udevdir) && rm -f $(RULES); \
 	fi
+endif
 

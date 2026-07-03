@@ -29,6 +29,10 @@ LD_LIBRARY_PATH=
 # if that device isn't going to be used. The .so files are broken out
 # into device-specific packages (eg, ka9q-radio-rx888) and the library
 # dependency is enforced when those packages are installed.
+# On Darwin there are no device packages; leave these unset so
+# src/Makefile can probe for installed vendor headers instead.
+# Explicit ENABLE_*= on the command line still overrides either way.
+ifneq ($(UNAME_S),Darwin)
 ENABLE_AIRSPY   ?= 1
 ENABLE_AIRSPYHF ?= 1
 ENABLE_BLADERF  ?= 1
@@ -44,6 +48,7 @@ ENABLE_SIG_GEN  ?= 1
 export ENABLE_AIRSPY ENABLE_AIRSPYHF ENABLE_BLADERF ENABLE_FOBOS
 export ENABLE_FUNCUBE ENABLE_HACKRF ENABLE_HYDRASDR
 export ENABLE_RTLSDR ENABLE_RX888 ENABLE_SDRPLAY ENABLE_SIG_GEN
+endif
 export DEB_BUILD_ARCH
 
 SUBDIRS=src aux share service rules docs config

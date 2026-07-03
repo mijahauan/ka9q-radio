@@ -1,17 +1,29 @@
+# Homebrew dependencies for building ka9q-radio on macOS
+# Usage: brew bundle --file=src/Brewfile
+#
+# Note: the Makefile prefers MacPorts (/opt/local) if it is installed;
+# force Homebrew with: make MACPREFIX="$(brew --prefix)"
+# See docs/INSTALL-macos.md for details.
+
 brew "pkg-config"
-brew "gdbm"
-brew "glib"
+
+# core libraries
+brew "fftw"
+brew "iniparser"
+brew "libogg"
+brew "libsamplerate"
 brew "libusb"
 brew "ncurses"
-brew "fftw"
-brew "hackrf"
-brew "libogg"
 brew "opus"
+brew "portaudio"
+
+# SDR front end driver libraries -- all optional; on macOS each driver is
+# built only if its library headers are found at build time.
+# RX888 and funcube need only libusb/portaudio from the core set above.
 brew "airspy"
 brew "airspyhf"
+brew "hackrf"
 brew "librtlsdr"
-brew "iniparser"
-brew "portaudio"
-brew "dbus"
-brew "libsamplerate"
-brew "liquid-dsp"
+brew "libbladerf"
+# hydrasdr and fobos are not in Homebrew; build those libraries from source
+# sdrplay requires the proprietary SDRplay API from sdrplay.com

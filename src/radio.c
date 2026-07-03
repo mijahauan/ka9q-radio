@@ -770,7 +770,7 @@ static void *process_section(void *p){
     if(pt == -1){
       fprintf(stderr,"channel template: can't allocate payload type for samprate %'d, channels %d, encoding %d\n",
 	      chan_template.output.samprate,chan_template.output.channels,chan_template.output.encoding); // make sure it's initialized
-	  return -1;
+	  return NULL;
     }
     chan_template.output.rtp.type = pt;
   }

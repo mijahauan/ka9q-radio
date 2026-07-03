@@ -1,11 +1,7 @@
 #ifndef _AVAHI_H
-#include <avahi-client/client.h>
-#include <avahi-client/publish.h>
-#include <avahi-common/alternative.h>
-#include <avahi-common/simple-watch.h>
-#include <avahi-common/malloc.h>
-#include <avahi-common/error.h>
-#include <avahi-common/timeval.h>
+// The publish/browse implementations shell out to the avahi CLI tools on
+// Linux and use the native dns_sd API on macOS; no libavahi headers needed.
+#include <stdbool.h>
 
 extern bool Static_avahi;
 

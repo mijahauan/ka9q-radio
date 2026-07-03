@@ -6,6 +6,9 @@ systemdunitdir ?= /etc/systemd/system
 bindir         ?= /usr/local/bin
 sbindir        ?= /usr/local/sbin
 recordingsdir  ?= /srv/ka9q-radio/recordings
+pkgdatadir     ?= /usr/local/share/ka9q-radio
+
+UNAME_S := $(shell uname -s)
 
 SERVICEFILES=acars.service aprsfeed.service cwd.service ft4-decode.service \
 	ft8-decode.service ft4-decode@.service ft8-decode@.service \
@@ -15,6 +18,32 @@ SERVICEFILES=acars.service aprsfeed.service cwd.service ft4-decode.service \
 
 .PHONY: clean all install uninstall purge
 
+ifeq ($(UNAME_S),Darwin)
+# macOS has launchd, not systemd. Install the plist template (with install
+# paths filled in); the radiod-launchd script instantiates it per instance.
+all:
+	@true
+
+clean:
+	@true
+
+purge:
+	@test "$(CONFIRMED)" = "1" || { \
+	    echo "Refusing to run purge directly. Use top-level make purge."; \
+	    exit 1; \
+	}
+	rm -f $(DESTDIR)$(pkgdatadir)/net.ka9q.radiod.plist.in
+
+install:
+	install -d -m 0755 $(DESTDIR)$(pkgdatadir)
+	sed -e 's|@sbindir@|$(sbindir)|g' net.ka9q.radiod.plist.in \
+	    > $(DESTDIR)$(pkgdatadir)/net.ka9q.radiod.plist.in
+	chmod 644 $(DESTDIR)$(pkgdatadir)/net.ka9q.radiod.plist.in
+
+uninstall:
+	rm -f $(DESTDIR)$(pkgdatadir)/net.ka9q.radiod.plist.in
+
+else
 all: $(SERVICEFILES)
 
 clean:
@@ -41,6 +70,7 @@ uninstall:
 	if [ -z "$(DESTDIR)" ] && command -v systemctl >/dev/null; then \
 		systemctl daemon-reload; \
 	fi
+endif
 
 %.service: %.service.in
 	sed -e 's|@bindir@|$(bindir)|g' \

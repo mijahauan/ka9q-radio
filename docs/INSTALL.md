@@ -2,7 +2,7 @@
 
 This package is designed for Debian Linux, including offshoots such as Ubuntu and the Raspberry Pi OS.
 
-Since I use a MacBook Pro as my desktop, some of it (e.g., the interactive components `control` and `monitor`) will also compile and run on MacOS - but not all of it.
+It also builds and runs on macOS; see [INSTALL-macos.md](INSTALL-macos.md).
 
 However, I'm interested in fixing any unnecessary non-portabilities.
 

@@ -52,6 +52,18 @@ purge:
 	SCRIPTS='$(SCRIPTS)' \
 	./purge.sh
 
+ifeq ($(UNAME_S),Darwin)
+# macOS: no sysusers/sysctl.d/modprobe.d/logrotate.d/cron.d. Just create the
+# runtime directories and install the launchd helper script.
+fftwdir ?= $(sysconfdir)/fftw
+logdir  ?= $(localstatedir)/log/ka9q-radio
+
+install:
+	install -d -m 0775 $(DESTDIR)$(radioconfdir) $(DESTDIR)$(statedir)
+	install -d -m 0775 $(DESTDIR)$(fftwdir) $(DESTDIR)$(logdir)
+	install -d -m 0755 $(DESTDIR)$(sbindir) $(DESTDIR)$(bindir)
+	install -m 0755 radiod-launchd $(DESTDIR)$(sbindir)
+else
 install:
 # Setup ka9q-radio directories
 	install -d -m 0775 $(DESTDIR)$(radioconfdir) $(DESTDIR)$(statedir) $(DESTDIR)$(statedir)/ft8
@@ -81,6 +93,7 @@ ifeq ($(strip $(DEB_BUILD_ARCH))$(UNAME_S),Linux)
 	$(DESTDIR)$(statedir) $(DESTDIR)$(statedir)/ft8 \
 	$(DESTDIR)$(statedir)/ft4 $(DESTDIR)$(statedir)/wspr \
 	$(DESTDIR)$(hfdllibdir)
+endif
 endif
 
 uninstall:

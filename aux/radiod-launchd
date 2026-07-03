@@ -1,0 +1,63 @@
+#!/bin/sh
+# Manage a launchd service for a radiod instance on macOS, the equivalent of
+# 'systemctl enable --now radiod@<instance>' on Linux.
+#
+# Usage: sudo radiod-launchd <instance>          create/replace, load and start
+#        sudo radiod-launchd <instance> remove   stop and remove
+#
+# Reads the plist template installed by 'make install' and substitutes the
+# instance name. radiod reads /etc/radio/radiod@<instance>.conf and logs to
+# /var/log/ka9q-radio/radiod@<instance>.log.
+
+set -e
+
+PKGDATADIR="${PKGDATADIR:-/usr/local/share/ka9q-radio}"
+TEMPLATE="$PKGDATADIR/net.ka9q.radiod.plist.in"
+INSTANCE="$1"
+
+if [ -z "$INSTANCE" ]; then
+    echo "Usage: $0 <instance> [remove]" >&2
+    exit 64
+fi
+case "$INSTANCE" in
+    *[!A-Za-z0-9._-]*)
+	echo "Instance name may only contain letters, digits, . _ -" >&2
+	exit 64;;
+esac
+if [ "$(id -u)" != 0 ]; then
+    echo "$0 must be run as root (sudo)" >&2
+    exit 77
+fi
+
+LABEL="net.ka9q.radiod.$INSTANCE"
+PLIST="/Library/LaunchDaemons/$LABEL.plist"
+
+if [ "$2" = "remove" ]; then
+    launchctl bootout system "$PLIST" 2>/dev/null || true
+    rm -f "$PLIST"
+    echo "Stopped and removed $LABEL"
+    exit 0
+fi
+
+CONF="/etc/radio/radiod@$INSTANCE.conf"
+if [ ! -r "$CONF" ]; then
+    echo "Warning: $CONF does not exist; radiod will exit until it does" >&2
+fi
+if [ ! -r "$TEMPLATE" ]; then
+    echo "Template $TEMPLATE not found; run 'sudo make install' first" >&2
+    exit 66
+fi
+
+mkdir -p /var/log/ka9q-radio /var/lib/ka9q-radio
+
+sed -e "s|@INSTANCE@|$INSTANCE|g" "$TEMPLATE" > "$PLIST"
+chmod 644 "$PLIST"
+chown root:wheel "$PLIST"
+
+launchctl bootout system "$PLIST" 2>/dev/null || true
+launchctl bootstrap system "$PLIST"
+launchctl kickstart -k "system/$LABEL"
+echo "Started $LABEL"
+echo "  config: $CONF"
+echo "  log:    /var/log/ka9q-radio/radiod@$INSTANCE.log"
+echo "  stop:   sudo $0 $INSTANCE remove"

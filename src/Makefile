@@ -53,13 +53,23 @@ ifdef SANITIZE
 endif
 
 ifeq ($(UNAME_S),Darwin)
-  INCLUDES += -I/opt/local/include
-  LDFLAGS  += -L/opt/local/lib
+  # Package prefix: MacPorts if installed, otherwise Homebrew. Override with MACPREFIX=
+  MACPREFIX ?= $(if $(wildcard /opt/local/include),/opt/local,$(shell brew --prefix 2>/dev/null))
+  INCLUDES += -I$(MACPREFIX)/include
+  LDFLAGS  += -L$(MACPREFIX)/lib
+  # Homebrew's ncurses is keg-only; add its paths if present
+  ifneq ($(wildcard $(MACPREFIX)/opt/ncurses),)
+    INCLUDES += -I$(MACPREFIX)/opt/ncurses/include
+    LDFLAGS  += -L$(MACPREFIX)/opt/ncurses/lib
+  endif
   LDLIBS += -lintl -liconv
-  SOFLAGS += -bundle -Wl,-undefined,dynamic_lookup
+  # .so link rules use SOFLAGS but not LDFLAGS, so the library path goes here too
+  SOFLAGS += -bundle -Wl,-undefined,dynamic_lookup -L$(MACPREFIX)/lib
 else
   LDLIBS += -lbsd -lrt
   SOFLAGS += -shared
+  RDYNAMIC = -rdynamic
+  LIBDL = -ldl
 endif
 
 IS_GCC_NOT_CLANG := $(shell \
@@ -68,6 +78,24 @@ IS_GCC_NOT_CLANG := $(shell \
 
 
 HAS_PIGPIO := $(shell printf '\043include <pigpio.h>\n' | $(CC) $(CPPFLAGS) -E - >/dev/null 2>&1 && echo 1)
+
+# On macOS there are no Debian device packages, so default each front end
+# driver to whether its vendor library headers are actually installed.
+# Explicit ENABLE_*= settings (command line or environment) still win.
+ifeq ($(UNAME_S),Darwin)
+check_header = $(shell printf '\043include <$(1)>\n' | $(CC) $(CPPFLAGS) $(INCLUDES) -E - >/dev/null 2>&1 && echo 1 || echo 0)
+ENABLE_AIRSPY   ?= $(call check_header,libairspy/airspy.h)
+ENABLE_AIRSPYHF ?= $(call check_header,libairspyhf/airspyhf.h)
+ENABLE_BLADERF  ?= $(call check_header,libbladeRF.h)
+ENABLE_FOBOS    ?= $(call check_header,fobos.h)
+ENABLE_FUNCUBE  ?= 1
+ENABLE_HACKRF   ?= $(call check_header,libhackrf/hackrf.h)
+ENABLE_HYDRASDR ?= $(call check_header,libhydrasdr/hydrasdr.h)
+ENABLE_RTLSDR   ?= $(call check_header,rtl-sdr.h)
+ENABLE_RX888    ?= 1
+ENABLE_SDRPLAY  ?= $(call check_header,sdrplay_api.h)
+ENABLE_SIG_GEN  ?= 1
+endif
 
 ifeq ($(BUILD),debug)
      DOPTS = -g
@@ -268,7 +296,7 @@ powers: powers.o dump.o libstatus.a libradio.a
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 radiod: $(RADIOD_OBJECTS)
-	$(CC) -rdynamic $(LDFLAGS) -o $@ $^ -lopus -lfftw3f_threads -lfftw3f -liniparser -lusb-1.0 -ldl $(LDLIBS)
+	$(CC) $(RDYNAMIC) $(LDFLAGS) -o $@ $^ -lopus -lfftw3f_threads -lfftw3f -liniparser -lusb-1.0 $(LIBDL) $(LDLIBS)
 
 rdsd: rdsd.o avahi.o libdsp.a libstatus.a libradio.a
 	$(CC) $(LDFLAGS) -o $@ $^ -lfftw3f_threads -lfftw3f $(LDLIBS)

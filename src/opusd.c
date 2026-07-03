@@ -31,6 +31,7 @@
 #include <signal.h>
 #include <getopt.h>
 #include <pthread.h>
+#include <poll.h>
 #include <sched.h>
 #include <sysexits.h>
 #include <fcntl.h>

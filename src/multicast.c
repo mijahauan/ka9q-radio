@@ -645,12 +645,18 @@ int join_group(int fd, struct sockaddr const * const source, struct sockaddr con
     {
       level = IPPROTO_IP;
       memcpy(&req.gr_group,group,sizeof(struct sockaddr_in));
+#ifdef __APPLE__
+      req.gr_group.ss_len = sizeof(struct sockaddr_in); // BSD kernels reject a sockaddr without a valid sa_len
+#endif
     }
     break;
   case AF_INET6:
     {
       level = IPPROTO_IPV6;
       memcpy(&req.gr_group,group,sizeof(struct sockaddr_in6));
+#ifdef __APPLE__
+      req.gr_group.ss_len = sizeof(struct sockaddr_in6);
+#endif
     }
     break;
   default:
@@ -782,6 +788,10 @@ static int ssm_join_group(int const fd, struct sockaddr const *source, struct so
     };
     memcpy(&gsreq.gsr_source, source, sizeof(struct sockaddr_in6));
     memcpy(&gsreq.gsr_group, group,  sizeof(struct sockaddr_in6));
+#ifdef __APPLE__
+    gsreq.gsr_source.ss_len = sizeof(struct sockaddr_in6); // BSD kernels reject a sockaddr without a valid sa_len
+    gsreq.gsr_group.ss_len = sizeof(struct sockaddr_in6);
+#endif
     if(setsockopt(fd, IPPROTO_IPV6, MCAST_JOIN_SOURCE_GROUP, &gsreq, sizeof gsreq) < 0){
       char name[IFNAMSIZ];
       fprintf(stderr, "join IPv6 group %s source %s on %s (%s) failed: %s\n",
