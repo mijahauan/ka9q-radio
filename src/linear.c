@@ -2,16 +2,9 @@
 // Handles USB/IQ/CW/etc, all modes but FM
 // Copyright May 2022-2023 Phil Karn, KA9Q
 
-#define DEFAULT_SHIFT (0.0)          // Post detection frequency shift, Hz
-#define DEFAULT_HEADROOM (-10.0)     // Target average output level, dBFS
-#define DEFAULT_HANGTIME (1.1)       // AGC gain hang time, sec
-#define DEFAULT_RECOVERY_RATE (20.0)  // AGC recovery rate after hang expiration, dB/s
-#define DEFAULT_GAIN (0.)           // Linear gain, dB
-#define DEFAULT_THRESHOLD (-15.0)     // AGC threshold, dB (noise will be at HEADROOM + THRESHOLD)
 #define DEFAULT_PLL_DAMPING (M_SQRT1_2); // PLL loop damping factor; 1/sqrt(2) is "critical" damping
 #define DEFAULT_PLL_LOCKTIME (.5);  // time, sec PLL stays above/below threshold SNR to lock/unlock
 
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <complex.h>
 #include <math.h>
@@ -25,7 +18,7 @@
 #include "radio.h"
 
 int demod_linear(void *arg){
-  struct channel * const chan = arg;
+  chan_t * const chan = arg;
   assert(chan != NULL);
   if(chan == NULL)
     return -1; // in case asserts are off
@@ -34,13 +27,12 @@ int demod_linear(void *arg){
   assert(frontend != NULL);
   assert(Blocktime != 0);
 
-  pthread_mutex_init(&chan->status.lock,NULL);
   pthread_mutex_lock(&chan->status.lock);
   int const blocksize = lrint(chan->output.samprate * Blocktime);
-  int const status = create_filter_output(&chan->filter.out,&chan->frontend->in,NULL,blocksize,COMPLEX);
+  int const status = create_filter_output(&chan->filter.out,&chan->frontend->in,blocksize,COMPLEX);
   if(status != 0){
     pthread_mutex_unlock(&chan->status.lock);
-    return -1;
+    goto quit;
   }
   chan->filter.out.beam = chan->filter.beam;
   if(chan->filter.out.beam)
@@ -81,11 +73,9 @@ int demod_linear(void *arg){
       }
     }
     pthread_mutex_unlock(&chan->status.lock);
-    if(restart_needed)
+    int r;
+    if(restart_needed || (r = downconvert(chan)) == -1)
       break; // restart or terminate
-    int r = downconvert(chan);
-    if(r == -1)
-      break; // restart needed
     else if(r == 1)
       continue; // channel inactive; poll for commands
 
@@ -186,7 +176,7 @@ int demod_linear(void *arg){
     }
     // Apply frequency shift
     // Must be done after PLL, which operates only on DC
-    assert(!isnan(chan->tune.shift) && isfinite(chan->tune.shift));
+    assert(isfinite(chan->tune.shift));
     set_osc(&chan->shift,chan->tune.shift/chan->output.samprate,0);
     if(chan->shift.freq != 0){
       for(int n=0; n < N; n++)
@@ -218,6 +208,7 @@ int demod_linear(void *arg){
 	// Divide into 2 ms slices. Hopefully divides evenly (it does for the usual sampling rates and block times)
 	// Should handle fractions if that ever happens
 	int samples_per_slice = lrint(N * .002 / Blocktime);
+	samples_per_slice = samples_per_slice < 1 ? 1 : samples_per_slice; // guard in case of a large Blocktime
 	int n = 0;
 	while(n + samples_per_slice < N){ // ignore any fragment at end
 	  double energy = 0;
@@ -262,7 +253,7 @@ int demod_linear(void *arg){
 	// if amplitude < headroom - threshold - 20 dB, increase gain 20 dB immediately?
 	gain_change = pow(chan->linear.recovery_rate, 1.0/chan->output.samprate);
       }
-      assert(!isnan(gain_change) && isfinite(gain_change) && gain_change != 0);
+      assert(isfinite(gain_change) && gain_change != 0);
     }
     // Final pass over signal block
     // Demodulate, apply gain changes, compute output energy
@@ -398,17 +389,15 @@ int demod_linear(void *arg){
       break; // No output stream!
 
   } while(true);
+  response(chan,response_needed); // in case one is pending as we're restarting
 
+ quit:;
   // clean up
   if(Verbose > 1)
-    fprintf(stderr,"%s exiting\n",chan->name);
+    fprintf(stderr,"%s returning\n",chan->name);
 
   FREE(chan->output.queue);
   chan->output.queue_length = 0;
-  for(int i=0; i < CQLEN; i++){
-    FREE(chan->commands[i].buffer);
-    chan->commands[i].length = 0;
-  }
   if(chan->opus.encoder != NULL){
     opus_encoder_destroy(chan->opus.encoder);
     chan->opus.encoder = NULL;
@@ -417,5 +406,5 @@ int demod_linear(void *arg){
   delete_filter_output(&chan->filter2.out);
   delete_filter_input(&chan->filter2.in);
   chan->baseband = NULL;
-  return 0;
+  return chan->demod_type == INVALID_DEMOD ? -1 : 0;
 }

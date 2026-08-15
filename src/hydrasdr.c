@@ -2,12 +2,12 @@
 // Copyright 2023, Phil Karn, KA9Q
 
 #undef DEBUG_AGC
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <pthread.h>
 #include <libhydrasdr/hydrasdr.h>
 #include <errno.h>
 #include <iniparser/iniparser.h>
+#include <string.h>
 #if defined(linux)
 #include <bsd/string.h>
 #endif
@@ -114,7 +114,7 @@ static void *hydrasdr_monitor(void *p);
 static double true_freq(uint64_t freq);
 static void set_gain(struct sdrstate *sdr,int gainstep);
 
-int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionary,char const * const section){
+int hydrasdr_setup(struct frontend * const frontend,dictionary const * const Dictionary,char const * const section){
   assert(Dictionary != NULL);
 
   struct sdrstate * const sdr = calloc(1,sizeof(struct sdrstate));
@@ -146,17 +146,29 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
     }
   }
   {
-    char const * const sn = config_getstring(Dictionary,section,"serial",NULL);
-    if(sn != NULL){
+    sdr->SN = 0;
+    extern char const *Serial; // Defined in main.c, set from -s on command line
+    char const *sn = NULL;
+    if(Serial != NULL && strlen(Serial) > 0){
+      fprintf(stderr,"Serial '%s' specified on command line\n",Serial);
+      sn = Serial;
+      char const *colon = strchr(sn,':');
+      if(colon != NULL)
+	sn = colon+1;
       char *endptr = NULL;
-      sdr->SN = 0;
       sdr->SN = strtoull(sn,&endptr,16);
-      if(endptr == NULL || *endptr != '\0'){
+      if(endptr == NULL || *endptr != '\0')
 	fprintf(stderr,"Invalid serial number %s in section %s\n",sn,section);
-	return -1;
-      }
-    } else {
-      // Serial number not specified, enumerate and pick one
+    }
+    // If not successfully set from command line, use keyword in config file, if any
+    if(sdr->SN == 0 && (sn = config_getstring(Dictionary,section,"serial",NULL)) != NULL){
+      char *endptr = NULL;
+      sdr->SN = strtoull(sn,&endptr,16);
+      if(endptr == NULL || *endptr != '\0')
+	fprintf(stderr,"Invalid serial number %s in section %s\n",sn,section);
+    }
+    // If it still hasn't been set, enumerate and pick one
+    if(sdr->SN == 0){
       int n_serials = 100; // ridiculously large
       uint64_t serials[n_serials];
 
@@ -827,7 +839,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
   else
     write_cfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT
 
-  if(sampcount != 0 && !isnan(in_energy) && isfinite(in_energy))
+  if(sampcount != 0 && isfinite(in_energy))
     frontend->if_power += Power_alpha * (in_energy / sampcount - frontend->if_power);
   if(sdr->software_agc){
     // Integrate A/D energy over A/D averaging period

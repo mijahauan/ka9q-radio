@@ -1,7 +1,6 @@
 // Load and search ka9q-radio preset definition table in presets.conf
 // Copyright 2018-2023, Phil Karn, KA9Q
 
-#define _GNU_SOURCE 1  // Avoid warnings when including dsp.h
 #include <assert.h>
 #include <errno.h>
 #include <math.h>
@@ -23,16 +22,18 @@
 #include "window.h"
 
 struct demodtab Demodtab[] = {
-      {LINEAR_DEMOD,   "Linear"}, // Coherent demodulation of AM, DSB, BPSK; calibration on WWV/WWVH/CHU carrier
-      {FM_DEMOD,       "FM",   }, // NBFM and noncoherent PM
-      {WFM_DEMOD,      "WFM",  }, // NBFM and noncoherent PM
-      {SPECT_DEMOD,    "Spectrum", }, // Spectrum analysis
-      {SPECT2_DEMOD,   "Spectrum2", },
+      {LINEAR_DEMOD,   "linear"}, // Coherent demodulation of AM, DSB, BPSK; calibration on WWV/WWVH/CHU carrier
+      {FM_DEMOD,       "fm",   }, // NBFM and noncoherent PM
+      {WFM_DEMOD,      "wfm",  }, // NBFM and noncoherent PM
+      {SPECT_DEMOD,    "spectrum", }, // Spectrum analysis
+      {SPECT2_DEMOD,   "spectrum2", },
+      {IDLE_DEMOD,     "idle", },
 };
 
 static int    const DEFAULT_TTL = 0;                // Don't blast cheap switches and access points unless the user says so
-static enum demod_type const DEFAULT_DEMOD = LINEAR_DEMOD;
+static enum demod_type const DEFAULT_DEMOD = IDLE_DEMOD;
 static int    const DEFAULT_LINEAR_SAMPRATE = 12000;
+static double const DEFAULT_LIFETIME = 0; // Infinite
 
 // Channel filter
 static double const DEFAULT_KAISER_BETA = 11.0;   // reasonable tradeoff between skirt sharpness and sidelobe height
@@ -70,7 +71,7 @@ static double const DEFAULT_CROSSOVER = 200;   // About where the two spectral a
 static double const DEFAULT_SPECTRUM_KAISER_BETA = 7.0; // Default for spectral analysis window
 static enum window_type const DEFAULT_WINDOW_TYPE = KAISER_WINDOW;
 static int    const DEFAULT_FFT_AVG = 10;      // number of FFTs averaged per spectrum display
-static double const DEFAULT_FFT_OVERLAP = 0.5;
+static double const DEFAULT_FFT_OVERLAP = 0;
 
 // Opus encoder defaults
 static int  const DEFAULT_OPUS_APPLICATION = OPUS_APPLICATION_AUDIO;
@@ -203,35 +204,45 @@ char const *demod_name_from_type(enum demod_type type){
 
 // Set reasonable defaults before reading preset or config tables
 // Note frontend entry must be set in radio.c since Frontend global is static
-int set_defaults(struct channel *chan){
-  if(chan == NULL)
+int set_defaults(chan_t *chan){
+  assert(chan != NULL && Blocktime > 0);
+  if(chan == NULL || Blocktime == 0)
     return -1;
 
-  chan->inuse = true;
-  snprintf(chan->name, sizeof chan->name, "new chan");
-  chan->output.silent = true; // Prevent burst of FM status messages on output channel at startup
+  chan->frontend = &Frontend;
+  chan->advertise = true;
+  strlcpy(chan->name, "new chan", sizeof chan->name);
+  chan->lifestart = chan->lifetime = DEFAULT_LIFETIME / Blocktime;
   chan->demod_type = DEFAULT_DEMOD;
-  chan->linear.env = false;
   chan->prio = default_prio();
-  chan->output.ttl = DEFAULT_TTL;
+
   chan->status.output_interval = DEFAULT_UPDATE;
+
+  chan->output.gain = dB2voltage(DEFAULT_GAIN);
+  chan->output.headroom = dB2voltage(DEFAULT_HEADROOM);
+  chan->output.ttl = DEFAULT_TTL;
+  chan->output.pacing = false;
   chan->output.maxdelay = 0;  // No output buffering
   chan->output.queue = NULL;
   chan->output.queue_length = 0;
-
+  chan->output.silent = true; // Prevent burst of FM status messages on output channel at startup
   chan->output.samprate = round_samprate(DEFAULT_LINEAR_SAMPRATE); // Don't trust even a compile constant
   chan->output.encoding = S16BE;
+  chan->output.channels = 1;
+  {
+    double r = remainder(Blocktime * chan->output.samprate,1.0);
+    if(r != 0)
+      fprintf(stderr,"Warning: non-integral samples in %.3f ms block at sample rate %d Hz: remainder %g\n",
+	      Blocktime,chan->output.samprate,r);
+  }
+  chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding);
 
+  chan->linear.env = false;
   chan->linear.agc = true;
   chan->linear.recovery_rate = dB2voltage(DEFAULT_RECOVERY_RATE);
   chan->linear.hangtime = DEFAULT_HANGTIME;
   chan->linear.threshold = dB2voltage(DEFAULT_THRESHOLD);
-  chan->output.headroom = dB2voltage(DEFAULT_HEADROOM);
-  chan->output.channels = 1;
-  if(isnan(chan->output.gain) || !isfinite(chan->output.gain) || chan->output.gain <= 0)
-     chan->output.gain = dB2voltage(DEFAULT_GAIN); // Set only if out of bounds
   chan->linear.dc_tau = DEFAULT_DC_TC; // primarily for removing AM carriers
-  chan->output.pacing = false;
 
   chan->opus.signal = DEFAULT_OPUS_SIGNAL;
   chan->opus.application = DEFAULT_OPUS_APPLICATION;
@@ -271,13 +282,6 @@ int set_defaults(struct channel *chan){
   chan->pll.square = false;
   chan->pll.loop_bw = DEFAULT_PLL_BW;
 
-
-  double r = remainder(Blocktime * chan->output.samprate,1.0);
-  if(r != 0){
-    fprintf(stderr,"Warning: non-integral samples in %.3f ms block at sample rate %d Hz: remainder %g\n",
-	    Blocktime,chan->output.samprate,r);
-    assert(false);
-  }
   chan->spectrum.overlap = DEFAULT_FFT_OVERLAP;
   chan->spectrum.fft_avg = DEFAULT_FFT_AVG;
   chan->spectrum.window_type = DEFAULT_WINDOW_TYPE;
@@ -292,10 +296,10 @@ int set_defaults(struct channel *chan){
   chan->tp1 = chan->tp2 = NAN;
   return 0;
 }
-
 // Set selected section of specified config file into current chan structure
 // Caller must (re) initialize pre-demod filter and (re)start demodulator thread
-int loadpreset(struct channel *chan,dictionary const *table,char const *sname){
+int loadpreset(chan_t *chan,dictionary const *table,char const *sname){
+  assert(chan != NULL && table != NULL && sname != NULL && strlen(sname) > 0);
   if(chan == NULL || table == NULL || sname == NULL || strlen(sname) == 0)
     return -1;
 
@@ -306,24 +310,43 @@ int loadpreset(struct channel *chan,dictionary const *table,char const *sname){
       chan->demod_type = x;
     snprintf(chan->name, sizeof chan->name, "%s %u", demod_name, chan->output.rtp.ssrc);
   }
+  chan->use_dns = config_getboolean(table, sname, "dns", chan->use_dns);
+  chan->advertise = config_getboolean(table,sname,"advertise",chan->advertise);
+  double lifetime = config_getdouble(table,sname,"lifetime",chan->lifetime * Blocktime);
+  chan->lifestart = chan->lifetime = lifetime / Blocktime;
   {
     char const *p = config_getstring(table,sname,"samprate",NULL);
     if(p != NULL){
-      int s = lrint(parse_frequency(p,false));
-      if(s != 0)
+      int s = labs(lrint(parse_frequency(p,false)));
+      if(s > 0)
 	chan->output.samprate = round_samprate(s);
     }
   }
-  // This test can't fail since round_samprate() forces it to a minimium of the blockrate; not sure what is ideal here
-  if(chan->output.samprate == 0)
-    chan->output.samprate = round_samprate(DEFAULT_LINEAR_SAMPRATE); // Make sure it gets set to *something*, even if wrong (e.g. for FM)
+  assert(chan->output.samprate > 0); // should have been set at least by default
   chan->output.channels = config_getint(table,sname,"channels",chan->output.channels);
   if(config_getboolean(table,sname,"mono",false))
     chan->output.channels = 1;
   if(config_getboolean(table,sname,"stereo",false))
     chan->output.channels = 2;
+  {
+    char const *cp = config_getstring(table,sname,"encoding",NULL);
+    if(cp){
+      int e = parse_encoding(cp);
+      if(e != NO_ENCODING)
+	chan->output.encoding = e;
+      else
+	fprintf(stderr,"%s: invalid encoding %s\n",chan->name,cp);
+    }
+  }
+  {
+    // We have what we need to assign a RTP payload type
+    int pt = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding);
+    if(pt == -1)
+      fprintf(stderr,"loadpreset(%s): can't allocate payload type for samprate %'d, channels %d, encoding %d\n",
+	      sname,chan->output.samprate,chan->output.channels,chan->output.encoding);
+    chan->output.rtp.type = pt;
+  }
   chan->filter.kaiser_beta = config_getdouble(table,sname,"kaiser-beta",chan->filter.kaiser_beta);
-
   // Pre-detection filter limits
   {
     char const *low = config_getstring(table,sname,"low",NULL);
@@ -413,7 +436,8 @@ int loadpreset(struct channel *chan,dictionary const *table,char const *sname){
     if(cp){
       double const tc = strtod(cp,NULL) * 1e-6;
       unsigned int samprate = (chan->demod_type == WFM_DEMOD) ? FULL_SAMPRATE : chan->output.samprate;
-      chan->fm.rate = -expm1(-1.0 / (tc * samprate));
+      if(tc != 0)
+	chan->fm.rate = -expm1(-1.0 / (tc * samprate));
     }
   }
   {
@@ -434,16 +458,6 @@ int loadpreset(struct channel *chan,dictionary const *table,char const *sname){
       chan->fm.tone_freq = tone;
   }
   chan->output.pacing = config_getboolean(table,sname,"pacing",chan->output.pacing);
-  {
-    char const *cp = config_getstring(table,sname,"encoding",NULL);
-    if(cp){
-      int e = parse_encoding(cp);
-      if(e != NO_ENCODING)
-	chan->output.encoding = e;
-      else
-	fprintf(stderr,"%s: invalid encoding %s\n",chan->name,cp);
-    }
-  }
   {
     int bitrate = abs(config_getint(table,sname,"bitrate",chan->opus.bitrate));
     bitrate = abs(config_getint(table,sname,"opus-bitrate",bitrate));
@@ -521,9 +535,40 @@ int loadpreset(struct channel *chan,dictionary const *table,char const *sname){
     chan->filter.a_weight = a_amp * csincospi(a_phase / 180.);
     chan->filter.b_weight = b_amp * csincospi(b_phase / 180.);
   }
+  {
+    char const *data = config_getstring(table,sname,"data",chan->output.dest_string);
+    strlcpy(chan->output.dest_string,data,sizeof chan->output.dest_string);
+  }
+  if(!chan->use_dns || resolve_mcast(chan->output.dest_string, &chan->output.dest_socket,DEFAULT_RTP_PORT,NULL,0,2) != 0){
+    // Not using DNS, or DNS resolution failed: create a IPv4 multicast address from a hash of the name
+    struct sockaddr_in *sin = (struct sockaddr_in *)&chan->output.dest_socket;
+    uint32_t addr = make_maddr(chan->output.dest_string);
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = htonl(addr);
+    sin->sin_port = htons(DEFAULT_RTP_PORT);
+  }
+  // --> Should ensure the channel data stream is distinct from the radiod status port !!
+  // Status sent to same data stream group, different port
+  memcpy(&chan->status.dest_socket, &chan->output.dest_socket, sizeof chan->status.dest_socket);
+  struct sockaddr const *sa = (struct sockaddr *)&chan->status.dest_socket;
+  switch(sa->sa_family){
+  case AF_INET:
+    {
+      struct sockaddr_in *sin = (struct sockaddr_in *)&chan->status.dest_socket;
+      sin->sin_port = htons(DEFAULT_STAT_PORT);
+    }
+    break;
+  case AF_INET6:
+    {
+      struct sockaddr_in6 *sin = (struct sockaddr_in6 *)&chan->status.dest_socket;
+      sin->sin6_port = htons(DEFAULT_STAT_PORT);
+      // should support avahi advertising of IPv6
+    }
+  default:
+    break;
+  }
   return 0;
 }
-
 // force an output sample rate to a multiple of the FFT block rate times the number of
 // new blocks in each FFT interval.
 // For the default block time of 20 ms and overlap of 1/5, this is (1/20 ms)*(5-1) = 50 Hz*4 = 200 Hz

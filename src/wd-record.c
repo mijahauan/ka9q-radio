@@ -52,7 +52,6 @@ Command-line options:
 //  - Cleanup from previous "wspr-decoded" version (e.g. remove unneeded variables/code)
 //
 
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
@@ -212,7 +211,7 @@ struct session {
   struct rtp_state rtp_state;
 
   // information obtained from status stream
-  struct channel chan;
+  chan_t chan;
   struct frontend frontend;
 
   double last_frequency;       // Detect changes to trigger Ogg Opus stream restarts
@@ -594,7 +593,6 @@ int main(int argc,char *argv[]){
   // Graceful signal catch
   signal(SIGPIPE,closedown); // Should catch the --exec or --stdout receiving process terminating
   signal(SIGINT,closedown);
-  signal(SIGKILL,closedown);
   signal(SIGQUIT,closedown);
   signal(SIGTERM,closedown);
 
@@ -1646,7 +1644,7 @@ void extract_source(uint8_t const * const buffer,int length){
  done:;
 }
 
-static void gen_locals(struct channel *channel){
+static void gen_locals(chan_t *channel){
   Local.noise_bandwidth = fabs(channel->filter.max_IF - channel->filter.min_IF);
   Local.sig_power = channel->sig.bb_power - Local.noise_bandwidth * channel->sig.n0;
   if(Local.sig_power < 0)
@@ -1723,7 +1721,7 @@ static void input_loop(){
       // NB! Assumes same IP source address *and UDP source port* for status and data
       // This is only true for recent versions of radiod, after the switch to unconnected output sockets
       // But older versions don't send status on the output channel anyway, so no problem
-      struct channel chan = {0};
+      chan_t chan = {0};
       struct frontend frontend = {0};
       decode_radio_status(&frontend,&chan,buffer+1,length-1);
       if (NULL == radio_mcast_group)

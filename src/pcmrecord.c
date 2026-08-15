@@ -40,7 +40,6 @@ Command-line options:
 // Now with --stdout option to send (one) stream to standard output, eventually to replace pcmcat
 // Also with --exec option to pipe stream into command, to replace pcmspawn
 // Copyright 2021-2024 Phil Karn, KA9Q
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <limits.h>
@@ -63,7 +62,7 @@ Command-line options:
 #include <inttypes.h>
 #include <ogg/ogg.h>
 #include <sys/file.h>
-
+#include <ctype.h>
 #include "misc.h"
 #include "attr.h"
 #include "multicast.h"
@@ -142,7 +141,7 @@ struct session {
   struct rtp_state rtp_state;
 
   // information obtained from status stream
-  struct channel chan;
+  chan_t chan;
   struct frontend frontend;
 
   double last_frequency;       // Detect changes to trigger Ogg Opus stream restarts
@@ -229,6 +228,7 @@ static int end_wav_stream(struct session *sp);
 static int send_wav_queue(struct session * const sp,bool flush);
 static int send_opus_queue(struct session * const sp,bool flush);
 static int send_queue(struct session * const sp,bool flush);
+static void sanitize_string(char *cp);
 
 static struct option Options[] = {
   {"ft8", no_argument, NULL, '8'}, // synonym for --jt --lengthlimit 15
@@ -413,7 +413,6 @@ int main(int argc,char *argv[]){
   // Graceful signal catch
   signal(SIGPIPE,closedown); // Should catch the --exec or --stdout receiving process terminating
   signal(SIGINT,closedown);
-  signal(SIGKILL,closedown);
   signal(SIGQUIT,closedown);
   signal(SIGTERM,closedown);
 
@@ -484,7 +483,7 @@ static void process_status(int fd){
   // NB! Assumes same IP source address *and UDP source port* for status and data
   // This is only true for recent versions of radiod, after the switch to unconnected output sockets
   // But older versions don't send status on the output channel anyway, so no problem
-  struct channel chan = {0}; // Must be cleared, decode_radio_status() may not write every field
+  chan_t chan = {0}; // Must be cleared, decode_radio_status() may not write every field
   struct frontend frontend = {0}; // ditto
   decode_radio_status(&frontend,&chan,buffer+1,length-1);
   chan.preset[sizeof chan.preset - 1] = '\0';
@@ -1164,7 +1163,12 @@ static int session_file_init(struct session *sp,struct sockaddr const *sender,in
 	  snprintf(temp,sizeof(temp),"$");
 	  break;
 	case 'd':
-	  snprintf(temp,sizeof(temp),"%s",sp->frontend.description);
+	  {
+	    char *sanity = strdup(sp->frontend.description);
+	    sanitize_string(sanity);
+	    snprintf(temp,sizeof(temp),"%s",sanity);
+	    FREE(sanity);
+	  }
 	  break;
 	case 'h':
 	  snprintf(temp,sizeof(temp),"%.1lf",sp->chan.tune.freq);
@@ -1401,6 +1405,8 @@ static int session_file_init(struct session *sp,struct sockaddr const *sender,in
     if(fd != -1) // If too long, open will fail with ENAMETOOLONG
       break;
     fprintf(stderr,"create %s failed: %s\n",tempfile,strerror(errno));
+    if(errno == ENOSPC)
+      exit(EX_CANTCREAT); // don't fill up syslog with error messages and make it worse
   }
   if(fd == -1){
     fprintf(stderr,"Giving up creating temp file, redirecting to /dev/null\n");
@@ -1408,8 +1414,9 @@ static int session_file_init(struct session *sp,struct sockaddr const *sender,in
     // Leave the temp file(s), the spool reader will clean it out if it's an old fragment
     fd = open("/dev/null",O_RDWR|O_NONBLOCK);
     if(fd == -1){
-      // Something is seriously wrong
+      // Something is very seriously wrong
       fprintf(stderr,"Can't open /dev/null: %s\n",strerror(errno));
+      exit(EX_CANTCREAT);
       return -1;
     }
     strlcpy(sp->filename,"/dev/null",sizeof sp->filename);
@@ -1868,4 +1875,11 @@ static int end_wav_stream(struct session *sp){
   if(fwrite(&header,sizeof(header),1,sp->fp) != 1)
     return -1;
   return 0;
+}
+static void sanitize_string(char *cp){
+  for(; *cp != '\0'; cp++){
+    unsigned char const c = *cp;
+    if(!(isalnum(c) || c == ' ' || c == '_' || c == '-' || c == '.' || c == '@' || c == '+' || c == ',' || c == ':' || c == '/'))
+       *cp = '_';
+  }
 }

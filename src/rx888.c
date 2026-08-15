@@ -8,12 +8,11 @@
 
 // VHF tuner support by K4VZ July 2024
 // Note: VHF tuner does not work yet -- KA9Q, 17 Aug 2024
-
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <pthread.h>
 #include <libusb-1.0/libusb.h>
 #include <iniparser/iniparser.h>
+#include <string.h>
 #if defined(linux)
 #include <bsd/string.h>
 #endif
@@ -22,6 +21,8 @@
 #include <strings.h>
 #include <assert.h>
 #include <stdatomic.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include "misc.h"
 #include "status.h"
@@ -31,13 +32,20 @@
 #include "si5351.h"
 #include "ezusb.h"
 
+// Uncomment this to cause proc_rx888 to use regular caching writes to the FFT input ring buffer
+// the default uses non-temporal writes that bypass cache because the 20ms FFT working sets are too big
+// at high sample rates to fit in typical L3 caches and they get evicted before the FFT can read them
+// Worse, the cached stores push out the FFT's working set, slowing it down
+// But you might experiment with this on CPUs with very large caches
+//#define CACHED_STORE 1
+
 static uint16_t const Vendor_id = 0x04b4;
 static uint16_t const Unloaded_product_id = 0x00f3;
 static uint16_t const Loaded_product_id = 0x00f1;
 
-static int64_t const MIN_SAMPRATE =      1000000; // 1 MHz, in ltc2208 spec
-static int64_t const MAX_SAMPRATE =    130000000; // 130 MHz, in ltc2208 spec
-static int64_t const DEFAULT_SAMPRATE = 64800000; // Synthesizes cleanly from 27 MHz reference
+static double const MIN_SAMPRATE =      1e6; // 1 MHz, in ltc2208 spec
+static double const MAX_SAMPRATE =    130e6; // 130 MHz, in ltc2208 spec
+static double const DEFAULT_SAMPRATE = 64.8e6; // Synthesizes cleanly from 27 MHz reference
 static double const NYQUIST = 0.47;  // Upper end of usable bandwidth, relative to 1/2 sample rate
 static double const AGC_UPPER_LIMIT = -15.0;   // Reduce RF gain if A/D level exceeds this in dBFS
 static double const AGC_LOWER_LIMIT = -26.0;   // Increase RF gain if level is below this in dBFS
@@ -45,16 +53,10 @@ static int const AGC_INTERVAL = 1;           // Seconds between runs of AGC loop
 static double const START_GAIN = 10.0;         // Initial VGA gain, dB
 static double const PTC  = 0.1; // 100 ms time constant for computing Power_smooth
 static double const DEFAULT_GAINCAL = +1.4;
-// smoothing alpha to block DC. Don't make too large (too quick) because the corrections are applied once per
-// (256K) block to minimize loss of precision, and the lag can cause instability
-static double const DC_ALPHA = 4e-7;
 
 // Reference frequency for Si5351 clock generator
-static long long const MIN_REFERENCE = 10e6;  //  10 MHz
-static long long const MAX_REFERENCE = 100e6; // 100 MHz
-static long long const DEFAULT_REFERENCE = 27e6;
+static double const DEFAULT_REFERENCE = 27e6;
 // Max allowable error on reference; 1e-4 = 100 ppm. Mainly to catch entry scaling errors
-static double const MAX_CALIBRATE = 1e-4;
 
 #if 0
 // Min and Max frequency for VHF/UHF tuner
@@ -106,7 +108,7 @@ struct sdrstate {
   double high_threshold;
   double low_threshold;
 
-  long long reference;
+  double reference;
   bool randomizer;
   bool dither;
   uint32_t gpios;
@@ -142,12 +144,13 @@ struct sdrstate {
 };
 
 
+static void load_rx888s(char const *firmware);
 static void rx_callback(struct libusb_transfer *transfer);
 static int rx888_usb_init(struct sdrstate *sdr,const char *firmware,unsigned int queuedepth,unsigned int reqsize);
 static void rx888_set_dither_and_randomizer(struct sdrstate *sdr,bool dither,bool randomizer);
 static void rx888_set_att(struct sdrstate *sdr,double att,bool vhf);
 static void rx888_set_gain(struct sdrstate *sdr,double gain,bool vhf);
-static double rx888_set_samprate(struct sdrstate *sdr,long long reference,long long samprate);
+static double rx888_set_samprate(struct sdrstate *sdr,double samprate);
 static void rx888_set_hf_mode(struct sdrstate *sdr);
 static int rx888_start_rx(struct sdrstate *sdr,libusb_transfer_cb_fn callback);
 static void rx888_stop_rx(struct sdrstate *sdr);
@@ -187,7 +190,6 @@ static char const *Rx888_keys[] = {
   "agc-low-threshold",
   "att", // synonym for atten
   "atten", // fixed attenuator gain, dB. Either -10 or +10 is interprepted as 10 dB of attenuation
-  "calibrate", // Set to zero when an external GPSDO or Rb/Cs reference is used
   "clock-rate-log", // Log measured sample rate every minute even when within tolerance
   "clock-step-logging", // Master enable for the RX888 sample-loss/offset-step monitor (default off)
   "clock-step-threshold", // |RTP<->GPS offset move| (sec) over an interval to log as sample loss; default 0.05
@@ -268,7 +270,6 @@ int rx888_setup(struct frontend * const frontend,dictionary const * const dictio
   // Enable/output output randomization
   sdr->randomizer = config_getboolean(dictionary,section,"rand",false);
   rx888_set_dither_and_randomizer(sdr,sdr->dither,sdr->randomizer);
-
   // RTP<->GPS offset / sample-loss monitor (opt-in; OFF by default so stock
   // radiod behaviour is unchanged for legacy users — see agc_rx888)
   sdr->clock_step_logging = config_getboolean(dictionary,section,"clock-step-logging",false);
@@ -317,34 +318,25 @@ int rx888_setup(struct frontend * const frontend,dictionary const * const dictio
   }
   rx888_set_gain(sdr,gain,false);
 
-  long long reference = DEFAULT_REFERENCE;
+  double reference = DEFAULT_REFERENCE;
   {
     char const *p = config_getstring(dictionary,section,"reference",NULL);
     if(p != NULL)
-      reference = llrint(parse_frequency(p,false));
+      reference = parse_frequency(p,false);
   }
-  if(reference < MIN_REFERENCE || reference > MAX_REFERENCE){
-    fprintf(stderr,"Invalid reference frequency %'lld, forcing %'lld\n", reference, DEFAULT_REFERENCE);
-    reference = DEFAULT_REFERENCE;
-  }
-  double calibrate = config_getdouble(dictionary,section,"calibrate",0);
-  if(fabsl(calibrate) >= MAX_CALIBRATE){
-    fprintf(stderr,"Unreasonable frequency calibration %.3g, setting to 0\n",calibrate);
-    calibrate = 0;
-  }
-  int64_t samprate = DEFAULT_SAMPRATE;
+  double samprate = DEFAULT_SAMPRATE;
   {
     char const *p = config_getstring(dictionary,section,"samprate",NULL);
     if(p != NULL)
-      samprate = llrint(parse_frequency(p,false));
+      samprate = parse_frequency(p,false);
   }
   if(samprate < MIN_SAMPRATE || samprate > MAX_SAMPRATE){
-    fprintf(stderr,"Invalid sample rate %'lld, ",(long long)samprate);
+    fprintf(stderr,"Invalid sample rate %'lf ",samprate);
     samprate = samprate < MIN_SAMPRATE ? MIN_SAMPRATE : MAX_SAMPRATE; // must be one or the other
-    fprintf(stderr,"forcing %'lld\n",(long long)samprate);
+    fprintf(stderr,"forcing %'lf\n",samprate);
   }
-  sdr->reference = reference * (1 + calibrate);
-  samprate = rx888_set_samprate(sdr,sdr->reference,samprate); // Update to actual samprate, if different
+  sdr->reference = reference;
+  samprate = rx888_set_samprate(sdr,samprate); // Update to actual samprate, if different
   frontend->samprate = samprate;
 
   sdr->undersample = config_getint(dictionary,section,"undersample",1);
@@ -418,6 +410,16 @@ int rx888_setup(struct frontend * const frontend,dictionary const * const dictio
 	  sdr->reqsize * sdr->pktsize,
 	  xfer_time);
 
+#if defined(__x86_64__)
+#ifdef CACHED_STORE
+  if(__builtin_cpu_supports("avx2") &&  __builtin_cpu_supports("popcnt"))
+    fprintf(stderr,"RX888 using avx2 vectorized callback with regular stores\n");
+#else
+  if(__builtin_cpu_supports("avx2") &&  __builtin_cpu_supports("popcnt"))
+    fprintf(stderr,"RX888 using avx2 vectorized callback with non-temporal stores\n");
+#endif
+#endif
+
 #if 0
   // VHF-UHF tuning
   {
@@ -450,12 +452,12 @@ int rx888_setup(struct frontend * const frontend,dictionary const * const dictio
   // Experimental spur notching, works on coherent spurs only
   // What generates 1/8, 2/8, 3/8? And probably 4/8 too, though that's the Nyquist freq
   // and we don't use it
-  frontend->spurs[0] = sdr->reference; // reference clock
+  frontend->spurs[0] = sdr->reference;
   frontend->spurs[1] = samprate / 8;
   frontend->spurs[2] = samprate / 4;  // 2/8
   frontend->spurs[3] = (3 * samprate) / 8;
   frontend->spurs[4] = 2 * sdr->reference;
-  if(samprate - 3 * sdr->reference > 0)
+  if(samprate - 3 * 2 * sdr->reference > 0)
     frontend->spurs[5] = samprate - 3 * sdr->reference; // 3rd harmonic of reference aliased back down
   return 0;
 }
@@ -579,7 +581,6 @@ static void *agc_rx888(void *arg){
   while((s = atomic_load(&sdr->state)) == RUNNING || s == STARTING){
     sleep(AGC_INTERVAL);
     int64_t now = gps_time_ns();
-
     // ── RTP<->GPS offset-step / sample-loss monitor (every AGC_INTERVAL) ──
     // The ADC clock is GPSDO-disciplined and GPS_TIME is the host's
     // GPS-disciplined clock, so over any interval the host time should
@@ -609,8 +610,8 @@ static void *agc_rx888(void *arg){
 		    move_sec, (double)d_gps/BILLION, fabs(lost_samples),
 		    lost_samples >= 0 ? "missing" : "extra", d_fail, sdr->cumulative_loss_sec,
 		    move_sec > 0 ? (d_fail > 0 ? "SAMPLE LOSS (USB transfer drop)"
-		                              : "SAMPLE LOSS (no USB failure flagged — investigate)")
-		                 : "host-clock step / extra samples");
+				    : "SAMPLE LOSS (no USB failure flagged — investigate)")
+		    : "host-clock step / extra samples");
 	  }
 	}
       } else
@@ -619,7 +620,6 @@ static void *agc_rx888(void *arg){
       sdr->monitor_last_samples = samples_now;
       sdr->monitor_last_failures = failures_now;
     }
-
     if(now >= sdr->last_count_time + 60 * BILLION){
       // Verify sample rate once per minute.  GPSDO-locked, so this should be
       // ~0 ppm; a steady deficit indicates ongoing sample loss.
@@ -642,6 +642,8 @@ static void *agc_rx888(void *arg){
 	sdr->message_posted = (fabs(error) > 0.01);
       }
     }
+    if(frontend->if_power == 0)
+      continue; // avoid -Inf dB
     double scaled_new_power = frontend->if_power * scale_ADpower2FS(frontend);
     double new_dBFS = power2dB(scaled_new_power);
 
@@ -673,10 +675,97 @@ static void *agc_rx888(void *arg){
   }
   return NULL;
 }
+#if defined(__x86_64__)
+#include <immintrin.h>
 
+// AVX2 vector version
+// Horizontal sum of four uint64_t in 256 bits
+__attribute__((target("avx2")))
+static inline uint64_t hsum_u64x4(__m256i x){
+    __m128i lo = _mm256_castsi256_si128(x);
+    __m128i hi = _mm256_extracti128_si256(x, 1);
+    __m128i sum = _mm_add_epi64(lo, hi);
+
+    return (uint64_t)_mm_cvtsi128_si64(sum) +
+           (uint64_t)_mm_extract_epi64(sum, 1);
+}
+__attribute__((target("avx2")))
+static int convert_avx2(float *restrict wptr,int16_t const *restrict samples, int sampcount, float scale, uint64_t *energy, bool randomize){
+  assert(((uintptr_t)wptr & 31) == 0);
+  assert((sampcount & 15) == 0);
+
+  __m256i energy0 = _mm256_setzero_si256();
+  __m256i energy1 = _mm256_setzero_si256();
+  __m256 const vscale = _mm256_set1_ps(scale);
+  __m256i const upper = _mm256_set1_epi16(32766);
+  __m256i const lower = _mm256_set1_epi16(-32766);
+  uint64_t clip_count = 0;
+
+  for(int i = 0; i < sampcount; i += 16){
+    __m256i x16 =  _mm256_loadu_si256((__m256i const *)(samples + i)); // load 16 int16_t samples
+    if(randomize){
+      // derandomize ADC 2208 samples: if lsb == 1, flip all other bits
+      __m256i mask = _mm256_slli_epi16(x16, 15);
+      mask = _mm256_srai_epi16(mask, 14);
+      x16 = _mm256_xor_si256(x16, mask);
+    }
+    // Compute energy: sums of squares, in two halves
+    __m256i const pair_energy = _mm256_madd_epi16(x16, x16); // combines pairs, produces 8 int32_t
+    __m128i const energy_lo = _mm256_castsi256_si128(pair_energy);           // lower 4 int32_t
+    __m128i const energy_hi = _mm256_extracti128_si256(pair_energy, 1);      // upper 4 int32_t
+    energy0 = _mm256_add_epi64(energy0,_mm256_cvtepu32_epi64(energy_lo));    // unsigned extend to 4 uint64_t in 256bit vector
+    energy1 = _mm256_add_epi64(energy1,_mm256_cvtepu32_epi64(energy_hi));    // unsigned extend to 4 uint64_t in 256bit vector
+
+    // Check for overranges: samples > 32766 or < -32766
+    __m256i const high =  _mm256_cmpgt_epi16(x16, upper);   // groups of 16 0's or 1s for each comparison
+    __m256i const low =   _mm256_cmpgt_epi16(lower, x16);
+    __m256i const clipped =  _mm256_or_si256(high, low);    // 0xffff if either limit
+    uint32_t const mask = (uint32_t)_mm256_movemask_epi8(clipped); // Extract two bits (0x11) from each group of 16, pack into 32 bits
+    clip_count += (unsigned)__builtin_popcount(mask) / 2; // because each 0xffff in clipped produces 2 bits
+
+    // convert to int32_t, convert to float, scale (in two groups of 8 samples each)
+    __m128i const lo16 = _mm256_castsi256_si128(x16);
+    __m128i const hi16 = _mm256_extracti128_si256(x16, 1);
+    __m256 const lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(lo16)),vscale);
+    __m256 const hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi16_epi32(hi16)),vscale);
+
+    // write one complete 64-byte cache line (16 samples)
+#ifdef CACHED_STORE // cached version
+    _mm256_store_ps(wptr + i, lo);
+    _mm256_store_ps(wptr + i + 8, hi);
+#else
+    // non-temporal store (bypass the cache) because it's not going to stick around anyway until the FFT reads it
+    // up to 20 ms from now
+    _mm256_stream_ps(wptr + i, lo);
+    _mm256_stream_ps(wptr + i + 8, hi);
+#endif
+  }
+  // must precede publication of the new write pointer
+  _mm_sfence();
+  *energy += hsum_u64x4(energy0) + hsum_u64x4(energy1);
+  return clip_count;
+}
+#endif
+// Portable C version
+static int convert(float *restrict wptr,int16_t const *restrict samples, int sampcount, float scale, uint64_t *energy, bool randomize){
+  int clip_count = 0;
+
+  for(int i = 0; i < sampcount; i ++){
+    int16_t x = samples[i];
+    if(randomize)
+      x ^= (x << 15) >> 14;
+    *energy += (int32_t)x * x;
+    if(x > 32766 || x < -32766)
+      clip_count++;
+
+    wptr[i] = (float)x * scale;
+  }
+  return clip_count;
+}
 
 // Callback called with incoming receiver data from A/D
-static void rx_callback(struct libusb_transfer * const transfer){
+//static void rx_callback(struct libusb_transfer * const transfer){
+void rx_callback(struct libusb_transfer * const transfer){
   assert(transfer != NULL);
   struct sdrstate * const restrict sdr = (struct sdrstate *)transfer->user_data;
   struct frontend * const restrict frontend = sdr->frontend;
@@ -686,7 +775,7 @@ static void rx_callback(struct libusb_transfer * const transfer){
   if(transfer->status == LIBUSB_TRANSFER_NO_DEVICE){
     sdr->device_gone = true;
     return;
-  }
+   }
   if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
     sdr->failure_count++;
     if(Verbose > 1)
@@ -703,48 +792,28 @@ static void rx_callback(struct libusb_transfer * const transfer){
   sdr->success_count++;
 
   // Feed directly into FFT input buffer, accumulate energy
-  double in_energy = 0; // A/D energy accumulator
+  uint64_t in_energy = 0; // A/D energy accumulator
   int16_t const * const restrict samples = (int16_t *)transfer->buffer;
   float * const restrict wptr = frontend->in.input_write_pointer.r;
   int const sampcount = size / sizeof(int16_t);
-  double delta_sum = 0;
-  if(sdr->randomizer){
-    for(int i=0; i < sampcount; i++){
-      int32_t s = samples[i];
-      s ^= (s << 31) >> 30; // Put LSB in sign bit, then shift back by one less bit to make ..ffffe or 0
-      if(abs(s) >= 32767){
-	frontend->overranges++;
-	frontend->samp_since_over = 0;
-      } else {
-	frontend->samp_since_over++;
-      }
-      // Remove DC offset
-      // Use double precision to avoid denormals
-      double const e  = s - sdr->dc_offset;
-      delta_sum += e;
-      in_energy += e * e;
-      wptr[i] = (float)(e * sdr->scale);
-    }
-  } else {
-    for(int i=0; i < sampcount; i++){
-      if(abs(samples[i]) >= 32767){
-	frontend->overranges++;
-	frontend->samp_since_over = 0;
-      } else {
-	frontend->samp_since_over++;
-      }
-      // Remove DC offset
-      // Use double precision to avoid denormals
-      double const s = samples[i] - sdr->dc_offset;
-      delta_sum += s;
-      in_energy += s * s;
-      wptr[i] = (float)(s * sdr->scale);
-    }
-  }
-  sdr->dc_offset += DC_ALPHA * delta_sum;
+  float const scale = (float)sdr->scale;
+  int overloads;
+#if defined(__x86_64__)
+  if(__builtin_cpu_supports("avx2") &&  __builtin_cpu_supports("popcnt"))
+    overloads = convert_avx2(wptr,samples,sampcount,scale,&in_energy,sdr->randomizer);
+  else
+#endif
+    overloads = convert(wptr,samples,sampcount,scale,&in_energy,sdr->randomizer);
+  if(overloads){
+    frontend->overranges += overloads;
+    frontend->samp_since_over = 0;
+  } else
+    frontend->samp_since_over += sampcount;
+
   // These blocks are kinda small, so exponentially smooth the power readings
-  if(sampcount != 0 && !isnan(in_energy) && isfinite(in_energy))
-    frontend->if_power += sdr->power_smooth * (in_energy / sampcount - frontend->if_power);
+  if(sampcount != 0)
+    frontend->if_power += sdr->power_smooth * ((double)in_energy / sampcount - frontend->if_power);
+
   frontend->samples += sampcount; // Count original samples
   if(atomic_load(&sdr->state) == RUNNING) {
     if(libusb_submit_transfer(transfer) == 0)
@@ -763,73 +832,8 @@ static int rx888_usb_init(struct sdrstate *const sdr,const char * const firmware
       return -1;
     }
   }
-  // If firmware file is not set (default), ignore unloaded rx888 devices, let rx888_boot get them
-  if(firmware != NULL && strlen(firmware) > 0){
-    // Search for unloaded rx888s (0x04b4:0x00f3) with the desired serial, or all such devices if no serial specified
-    // and load with firmware
-    // With the rx888 bootloader launched by udev, this section will usually not find anything
-    // but a race is possible at boot time when systemd starts both at the same time
-    // So it's recommended to let rx888_boot handle unloaded devices
-    libusb_device **device_list;
-    ssize_t dev_count = libusb_get_device_list(NULL,&device_list);
-    for(ssize_t i=0; i < dev_count; i++){
-      libusb_device *device = device_list[i];
-      if(device == NULL)
-	break; // End of list
-
-      struct libusb_device_descriptor desc = {0};
-      int rc = libusb_get_device_descriptor(device,&desc);
-      if(rc != 0){
-	fprintf(stderr," libusb_get_device_descriptor() failed: %s\n",libusb_strerror(rc));
-	continue;
-      }
-      if(desc.idVendor != Vendor_id || desc.idProduct != Unloaded_product_id)
-	continue;
-
-      fprintf(stderr,"found unloaded rx888 vendor %04x, device %04x",desc.idVendor,desc.idProduct);
-      libusb_device_handle *handle = NULL;
-      rc = libusb_open(device,&handle);
-      if(rc != 0 || handle == NULL){
-	fprintf(stderr,", libusb_open() failed: %s\n",libusb_strerror(rc));
-	continue;
-      }
-      if(desc.iManufacturer){
-	char manufacturer[100] = {0};
-	int ret = libusb_get_string_descriptor_ascii(handle,desc.iManufacturer,(unsigned char *)manufacturer,sizeof(manufacturer));
-	if(ret > 0)
-	  fprintf(stderr,", manufacturer '%s'",manufacturer);
-      }
-      if(desc.iProduct){
-	char product[100] = {0};
-	int ret = libusb_get_string_descriptor_ascii(handle,desc.iProduct,(unsigned char *)product,sizeof(product));
-	if(ret > 0)
-	  fprintf(stderr,", product '%s'",product);
-      }
-      char serial[100] = {0};
-      if(desc.iSerialNumber){
-	int ret = libusb_get_string_descriptor_ascii(handle,desc.iSerialNumber,(unsigned char *)serial,sizeof(serial));
-	if(ret > 0){
-	  fprintf(stderr,", serial '%s'",serial);
-	}
-      }
-      // The proper serial number doesn't appear until the device is loaded with firmware, so load all we find
-      char full_firmware_file[PATH_MAX] = {0};
-      dist_path(full_firmware_file,sizeof(full_firmware_file),firmware);
-      fprintf(stderr,", loading rx888 firmware file %s\n",full_firmware_file);
-      if(ezusb_load_ram(handle,full_firmware_file,FX_TYPE_FX3,IMG_TYPE_IMG,1) == 0){
-	fprintf(stderr,"rx888 loaded\n");
-	sleep(1); // how long should this be?
-      } else {
-	fprintf(stderr,"rx888 load failed for device %d.%d (logical)\n",
-		libusb_get_bus_number(device),libusb_get_device_address(device));
-      }
-      libusb_close(handle);
-      handle = NULL;
-    }
-    libusb_free_device_list(device_list,1);
-    device_list = NULL;
-  }
-  // Scan list again, looking for a loaded RX888 with the right numbers
+  load_rx888s(firmware);
+  // Look for a loaded RX888 with the right numbers
   if(Serial != NULL){ // specified on command line, overrides config file
     // Specified on command line, convert and compare
     sdr->serial = strtoll(Serial,NULL,16); // always hex
@@ -840,7 +844,7 @@ static int rx888_usb_init(struct sdrstate *const sdr,const char * const firmware
     fprintf(stderr,"Looking for rx888 at %d:%d\n",USB_busnum,USB_devnum);
 
   libusb_device *device = NULL;
-  libusb_device **device_list;
+  libusb_device **device_list = NULL;
   ssize_t dev_count = libusb_get_device_list(NULL,&device_list);
   // Fallback for a stale/miscased configured serial: if the serial matches no
   // device but exactly one rx888 is present, use it and log its real serial so
@@ -945,9 +949,11 @@ static int rx888_usb_init(struct sdrstate *const sdr,const char * const firmware
     libusb_close(fallback_handle); // unused (no match needed, or multiple rx888s present)
     fallback_handle = NULL;
   }
-  libusb_free_device_list(device_list,1);
-  device_list = NULL;
-
+  // NOTE: deliberately NOT freeing device_list here.  The original fork
+  // patch did, which unrefs `device` while it is still dereferenced by
+  // libusb_get_config_descriptor() below -- safe only because
+  // libusb_open() holds its own reference.  Upstream frees after the
+  // descriptor is read, which is the correct order; leave it to them.
   // If a device has been found, device and dev_handle will be non-NULL
   if(device == NULL || sdr->dev_handle == NULL){
     fprintf(stderr,"Error or device could not be found\n");
@@ -1009,6 +1015,10 @@ static int rx888_usb_init(struct sdrstate *const sdr,const char * const firmware
     sdr->pktsize = endpointDesc->wMaxPacketSize * (ep_comp->bMaxBurst + 1);
     libusb_free_ss_endpoint_companion_descriptor(ep_comp);
   }
+  libusb_free_device_list(device_list,1);
+  device_list = NULL;
+  device = NULL;
+
   sdr->databuffers = (u_char **)calloc(queuedepth,sizeof(u_char *));
   if(sdr->databuffers == NULL){
     fprintf(stderr,"Failed to allocate data buffers\n");
@@ -1032,8 +1042,8 @@ static int rx888_usb_init(struct sdrstate *const sdr,const char * const firmware
 end:;
   free_transfer_buffers(sdr->databuffers,sdr->transfers,sdr->queuedepth);
 
-  FREE(sdr->transfers);
-  FREE(sdr->databuffers);
+  sdr->transfers = NULL;
+  sdr->databuffers = NULL;
 
   if(sdr->dev_handle != NULL)
     libusb_release_interface(sdr->dev_handle,0);
@@ -1047,8 +1057,80 @@ end:;
     libusb_close(sdr->dev_handle);
   sdr->dev_handle = NULL;
 
+  if(device_list != NULL)
+    libusb_free_device_list(device_list,1);
+  device_list = NULL;
+
   libusb_exit(NULL);
   return -1;
+}
+// Load any Rx888s found in bootloader mode
+// We can't be selective since the serial numbers aren't visible until the firmware is running
+// With the rx888 bootloader launched by udev, this section will usually not find anything
+// but a race is possible at boot time when systemd starts both at the same time
+// So it's recommended to let rx888_boot handle unloaded devices
+static void load_rx888s(char const *firmware){
+  if(firmware == NULL || strlen(firmware) == 0)
+    return;
+
+  libusb_device **device_list;
+  ssize_t dev_count = libusb_get_device_list(NULL,&device_list);
+  for(ssize_t i=0; i < dev_count; i++){
+    libusb_device *device = device_list[i];
+    if(device == NULL)
+      break; // End of list
+
+    struct libusb_device_descriptor desc = {0};
+    int rc = libusb_get_device_descriptor(device,&desc);
+    if(rc != 0){
+      fprintf(stderr," libusb_get_device_descriptor() failed: %s\n",libusb_strerror(rc));
+      continue;
+    }
+    if(desc.idVendor != Vendor_id || desc.idProduct != Unloaded_product_id)
+      continue;
+
+    fprintf(stderr,"found unloaded rx888 vendor %04x, device %04x",desc.idVendor,desc.idProduct);
+    libusb_device_handle *handle = NULL;
+    rc = libusb_open(device,&handle);
+    if(rc != 0 || handle == NULL){
+      fprintf(stderr,", libusb_open() failed: %s\n",libusb_strerror(rc));
+      continue;
+    }
+    if(desc.iManufacturer){
+      char manufacturer[100] = {0};
+      int ret = libusb_get_string_descriptor_ascii(handle,desc.iManufacturer,(unsigned char *)manufacturer,sizeof(manufacturer));
+      if(ret > 0)
+	fprintf(stderr,", manufacturer '%s'",manufacturer);
+    }
+    if(desc.iProduct){
+      char product[100] = {0};
+      int ret = libusb_get_string_descriptor_ascii(handle,desc.iProduct,(unsigned char *)product,sizeof(product));
+      if(ret > 0)
+	fprintf(stderr,", product '%s'",product);
+    }
+    char serial[100] = {0};
+    if(desc.iSerialNumber){
+      int ret = libusb_get_string_descriptor_ascii(handle,desc.iSerialNumber,(unsigned char *)serial,sizeof(serial));
+      if(ret > 0){
+	fprintf(stderr,", serial '%s'",serial);
+      }
+    }
+    // The proper serial number doesn't appear until the device is loaded with firmware, so load all we find
+    char full_firmware_file[PATH_MAX] = {0};
+    dist_path(full_firmware_file,sizeof(full_firmware_file),firmware);
+    fprintf(stderr,", loading rx888 firmware file %s\n",full_firmware_file);
+    if(ezusb_load_ram(handle,full_firmware_file,FX_TYPE_FX3,IMG_TYPE_IMG,1) == 0){
+      fprintf(stderr,"rx888 loaded\n");
+      sleep(1); // how long should this be?
+    } else {
+      fprintf(stderr,"rx888 load failed for device %d.%d (logical)\n",
+	      libusb_get_bus_number(device),libusb_get_device_address(device));
+    }
+    libusb_close(handle);
+    handle = NULL;
+  }
+  libusb_free_device_list(device_list,1);
+  device_list = NULL;
 }
 
 static void rx888_set_dither_and_randomizer(struct sdrstate *sdr,bool dither,bool randomizer){
@@ -1269,14 +1351,13 @@ double rx888_tune(struct frontend *frontend,double freq){
 #endif
 }
 
-double rx888_set_samprate(struct sdrstate *sdr, long long const reference, long long const samprate){
+static double rx888_set_samprate(struct sdrstate *sdr, double const samprate){
   assert(sdr != NULL);
-  assert(reference != 0);
-  assert(samprate != 0);
+  assert(isfinite(samprate) && samprate > 0);
 
   si5351_solution_t best = {0};
-  if(!si5351_solve(reference,samprate,&best)){
-    fprintf(stderr,"si5351_solve(%'lld, %'lld) failed\n", reference, samprate);
+  if(!si5351_solve(sdr->reference,samprate,&best)){
+    fprintf(stderr,"si5351_solve(reference=%'lf, samprate=%'lf) failed\n", sdr->reference, samprate);
     return 0;
   }
   if(best.E == 0)
@@ -1284,19 +1365,11 @@ double rx888_set_samprate(struct sdrstate *sdr, long long const reference, long 
 
   si5351_pvals_t pll = {0};
   si5351_get_pll_pvals(&best,&pll);
-  {
-    long long whole_hz,num,denom;
-    whole_hz = reference * best.B / best.C;
-    num = reference * best.B % best.C;
-    denom = best.C;
-    whole_hz += reference * best.A;
-    fprintf(stderr,"RX888 Si5351 PLL: vco = %'lld * (%'d + %'d/%'d) = %'lld",
-	  reference,
-	    best.A, best.B, best.C, whole_hz);
-    if(num != 0)
-      fprintf(stderr," + %'lld/%'lld", num, denom);
-  }
-  fprintf(stderr," Hz; P1=%d, P2=%d, P3=%d\n",pll.P1, pll.P2, pll.P3);
+  // doubles ref and vco are for display only
+  double const vco = sdr->reference * (best.A + (double)best.B / best.C);
+  fprintf(stderr,"RX888 Si5351 PLL: vco = %'lf * (%'u + %'u/%'u) = %'lf Hz;",
+	  sdr->reference, best.A, best.B, best.C, vco);
+  fprintf(stderr," P1=%u, P2=%u, P3=%u\n",pll.P1, pll.P2, pll.P3);
   uint8_t data_clkin[] = {
     (pll.P3 & 0x0000ff00) >>  8,
     (pll.P3 & 0x000000ff) >>  0,
@@ -1311,17 +1384,11 @@ double rx888_set_samprate(struct sdrstate *sdr, long long const reference, long 
 
   si5351_pvals_t ms = {0};
   si5351_get_ms_pvals(&best,&ms);
-  fprintf(stderr,"RX888 Si5351 output divider: samprate = vco / (%'d*(%'d + %'d/%'d)) = %'lld",
-	  best.R, best.D, best.E, best.F, best.fout_num);
-  if(best.fout_den != 1){
-    long long whole_hz = best.fout_num / best.fout_den;
-    long long num = best.fout_num % best.fout_den;
-    fprintf(stderr,"/%'lld = %'lld + %'lld/%'lld", best.fout_den, whole_hz, num, best.fout_den);
-  }
-  fprintf(stderr," Hz");
-  if(best.err_num != 0)
-    fprintf(stderr," (error = %'lld/%'lld)",(long long)best.err_num, best.fout_den);
-  fprintf(stderr,"; P1=%d, P2=%d, P3=%d\n", ms.P1, ms.P2, ms.P3);
+  // Calculate actual output sample rate
+  double const fout = vco / (best.R * (best.D + (double)best.E / best.F));
+  fprintf(stderr,"RX888 Si5351 output divider: samprate = vco / (%'u*(%'u + %'u/%'u)) = %'lf Hz",
+	  best.R, best.D, best.E, best.F, fout);
+  fprintf(stderr,"; P1=%u, P2=%u, P3=%u\n", ms.P1, ms.P2, ms.P3);
   uint8_t data_clkout[] = {
     (ms.P3 & 0x0000ff00) >>  8,
     (ms.P3 & 0x000000ff) >>  0,
@@ -1333,5 +1400,5 @@ double rx888_set_samprate(struct sdrstate *sdr, long long const reference, long 
     (ms.P2 & 0x000000ff) >>  0
   };
   si5351_write(sdr,SI5351_REGISTER_MS0_BASE,data_clkout,sizeof(data_clkout));
-  return (double)best.fout_num / best.fout_den;
+  return fout;
 }

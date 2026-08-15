@@ -1,6 +1,5 @@
 // Various window functions for Fourier analysis, filter design, etc
-// Jan 2026 Phil Karn, KA9Q
-#define _GNU_SOURCE 1
+// Copyright Jan 2026 Phil Karn, KA9Q
 #include <unistd.h>
 #include <math.h>
 #include <stdbool.h>
@@ -90,7 +89,7 @@ double hp5ft_window(int n, int N){
 // Used by gaussian_window
 // https://en.wikipedia.org/wiki/Window_function (section Approximate confined Gaussian window)
 static inline double G(double const x,int const N, double const s){
-  assert(!isnan(s) && isfinite(s));
+  assert(isfinite(s));
   int const L = N+1;
   assert(L != 0 && s != 0);
   double const tmp = (x - N/2) / (2 * L *s);
@@ -98,13 +97,13 @@ static inline double G(double const x,int const N, double const s){
 }
 
 double gaussian_window(int n, int N, double s){
-  assert(N > 1 && n >=0 && n < N && !isnan(s) && isfinite(s));
+  assert(N > 1 && n >=0 && n < N && isfinite(s));
   if(N <= 1)
     return 1.0;
   if(n < 0 || n >= N)
     return 0.0;
 
-  if(isnan(s) || !isfinite(s) || s < 1e-6){
+  if(!isfinite(s) || s < 1e-6){
     // Special case to avoid divide by zero -> exp(-infinity)
     if(N & 1) // odd?
       return (n == N/2 - 1) ? 1 : 0;
@@ -187,7 +186,7 @@ static double const kaiser(int const n,int const M, double const beta){
 // More efficient than repeatedly calling kaiser(n,M,beta)
 int make_kaiser(double * const window,int const M,double const beta){
   assert(window != NULL);
-  if(window == NULL)
+  if(window == NULL || M < 2 || !isfinite(beta))
     return -1;
 
   // Precompute unchanging partial values
@@ -217,7 +216,7 @@ int make_kaiser(double * const window,int const M,double const beta){
 // More efficient than repeatedly calling kaiser(n,M,beta)
 int make_kaiserf(float * const window,int const M,double const beta){
   assert(window != NULL);
-  if(window == NULL)
+  if(window == NULL || M < 2 || !isfinite(beta))
     return -1;
 
   // Precompute unchanging partial values
@@ -245,6 +244,8 @@ int normalize_windowf(float * const window, int const M){
   double window_gain = 0;
   for(int n = 0; n < M; n++)
     window_gain += window[n];
+  if(window_gain == 0 || !isfinite(window_gain))
+    return -1;
   window_gain = M / window_gain;
   for(int i = 0; i < M; i++)
     window[i] *= (float)window_gain;

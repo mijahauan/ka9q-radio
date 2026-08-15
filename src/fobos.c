@@ -10,13 +10,13 @@ stream centered on the tuner LO.
 In direct sample mode you can also treat the inputs as complex, or select or combine them
 on a per-channel basis by selecting output filter type BEAM and calling set_filter_weights() in filter.c
 */
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <fobos.h>
 #include <iniparser/iniparser.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <string.h>
 #if defined(linux)
 #include <bsd/string.h>
 #endif
@@ -98,7 +98,7 @@ static int find_serial_position(const char *serials, const char *serialnumcfg) {
 }
 
 ///////////////////////////////////////////////////////////
-int fobos_setup(struct frontend *const frontend, dictionary *const dictionary,
+int fobos_setup(struct frontend *const frontend, dictionary const * const dictionary,
                 char const *const section) {
   assert(dictionary != NULL);
   config_validate_section(stderr, dictionary, section, Fobos_keys, NULL);
@@ -414,7 +414,7 @@ static void rx_callback(float *buf, uint32_t len, void *ctx) {
   write_cfilter(&frontend->in, NULL,sampcount); // Update write pointer, invoke FFT
   frontend->samples += sampcount;
 
-  if (!isnan(in_energy) && isfinite(in_energy))
+  if (isfinite(in_energy))
     frontend->if_power += Power_alpha * (in_energy / sampcount - frontend->if_power);
 }
 

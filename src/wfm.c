@@ -1,7 +1,6 @@
 // Wideband FM demodulation
 // Copyright 2020-2025, Phil Karn, KA9Q
 // Still needs some work, e.g., cascaded filter restructuring
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <pthread.h>
 #include <string.h>
@@ -25,13 +24,12 @@ static int const Composite_samprate = 8 * FULL_SAMPRATE;
 // FM demodulator thread
 int demod_wfm(void *arg){
   assert(arg != NULL);
-  struct channel * chan = arg;
+  chan_t * chan = arg;
   if(chan == NULL)
     return -1;
 
   assert(Blocktime != 0);
   assert(chan->frontend != NULL);
-  pthread_mutex_init(&chan->status.lock,NULL);
   pthread_mutex_lock(&chan->status.lock);
   // This is not the downconverter samprate, but the audio output samprate so as not to confuse consumers
   chan->output.samprate = (int)Audio_samprate;
@@ -53,10 +51,10 @@ int demod_wfm(void *arg){
     goto quit; // Front end sample rate is too low - should probably fix filter to allow interpolation
 
   delete_filter_output(&chan->filter.out);
-  int status = create_filter_output(&chan->filter.out,&chan->frontend->in,NULL,composite_L, COMPLEX);
+  int status = create_filter_output(&chan->filter.out,&chan->frontend->in,composite_L, COMPLEX);
   if(status != 0){
     pthread_mutex_unlock(&chan->status.lock);
-    return -1;
+    goto quit;
   }
   chan->filter.out.beam = chan->filter.beam;
   if(chan->filter.out.beam)
@@ -82,19 +80,19 @@ int demod_wfm(void *arg){
 
   // Composite filters, decimate from 384 Khz to 48 KHz
   struct filter_out mono = {0};
-  create_filter_output(&mono,&composite,NULL,audio_L, REAL);
+  create_filter_output(&mono,&composite,audio_L, REAL);
   set_filter(&mono,50.0/Audio_samprate, 15000.0/Audio_samprate, chan->filter.kaiser_beta);
 
   // Narrow filter at 19 kHz for stereo pilot
   // FCC says +/- 2 Hz, with +/- 20 Hz protected (73.322)
   struct filter_out pilot = {0};
-  create_filter_output(&pilot,&composite,NULL,audio_L, COMPLEX);
+  create_filter_output(&pilot,&composite,audio_L, COMPLEX);
   set_filter(&pilot,-100./Audio_samprate, 100./Audio_samprate, chan->filter.kaiser_beta);
 
   // Stereo difference (L-R) information on DSBSC carrier at 38 kHz
   // Extends +/- 15 kHz around 38 kHz
   struct filter_out lminusr = {0};
-  create_filter_output(&lminusr,&composite,NULL,audio_L, COMPLEX);
+  create_filter_output(&lminusr,&composite,audio_L, COMPLEX);
   set_filter(&lminusr,-15000./Audio_samprate, 15000./Audio_samprate, chan->filter.kaiser_beta);
 
   // The asserts should be valid for clean sample rates multiples of 200 Hz
@@ -134,11 +132,9 @@ int demod_wfm(void *arg){
       }
     }
     pthread_mutex_unlock(&chan->status.lock);
-    if(restart_needed)
+    int r;
+    if(restart_needed || (r = downconvert(chan)) == -1)
       break; // restart or terminate
-    int r = downconvert(chan);
-    if(r == -1)
-      break; // restart needed
     else if(r == 1)
       continue; // channel inactive; poll for commands
 
@@ -168,7 +164,7 @@ int demod_wfm(void *arg){
     for(int n=0; n < composite_L; n++){
       // Although deviation can be zero, argf() is defined as returning 0, not NAN
       double const np = M_1_PI * cargf(buffer[n]); // -1 to +1
-      assert(!isnan(np) && isfinite(np));
+      assert(isfinite(np));
       double const x = np - phase_memory;
       phase_memory = np;
       composite.input_write_pointer.r[n] = x > 1 ? x - 2 : x < -1 ? x + 2 : x; // reduce difference to -1 to +1
@@ -232,7 +228,7 @@ int demod_wfm(void *arg){
 	if(pt == -1){
 	  fprintf(stderr,"%s can't allocate payload type for samprate %'d, channels %d, encoding %d\n",
 		  chan->name,chan->output.samprate,chan->output.channels,chan->output.encoding); // make sure it's initialized
-	  return -1;
+	  goto quit;
 	}
 	chan->output.rtp.type = pt;
       }
@@ -247,8 +243,8 @@ int demod_wfm(void *arg){
 	double complex subc_phasor = pilot.output.c[n]; // 19 kHz pilot
 	subc_phasor = (subc_phasor * subc_phasor) / cnrm(subc_phasor); // square to 38 kHz and normalize
 	double const subc_info = 2.0f * __imag__ (conj(subc_phasor) * lminusr.output.c[n]); // Carrier is in quadrature
-	assert(!isnan(subc_info));
-	assert(!isnan(mono.output.r[n]));
+	assert(isfinite(subc_info));
+	assert(isfinite(mono.output.r[n]));
 	// demultiplex: 2L = (L+R) + (L-R); 2R = (L+R) - (L-R)
 	// L+R = mono.output.r[n]; L-R = subc_info
 	// real(s) = L, imag(s) = R
@@ -271,7 +267,7 @@ int demod_wfm(void *arg){
 	if(pt == -1){
 	  fprintf(stderr,"%s can't allocate payload type for samprate %'d, channels %d, encoding %d\n",
 		  chan->name,chan->output.samprate,chan->output.channels,chan->output.encoding); // make sure it's initialized
-	  return -1;
+	  goto quit;
 	}
 	chan->output.rtp.type = pt;
       }
@@ -299,17 +295,15 @@ int demod_wfm(void *arg){
 	break; // No output stream! Terminate
     }
   } while(true);
+  response(chan,response_needed); // in case one is pending as we're restarting
+
  quit:;
   // clean up
   if(Verbose > 1)
-    fprintf(stderr,"%s exiting\n",chan->name);
+    fprintf(stderr,"%s returning\n",chan->name);
 
   FREE(chan->output.queue);
   chan->output.queue_length = 0;
-  for(int i=0; i < CQLEN; i++){
-    FREE(chan->commands[i].buffer);
-    chan->commands[i].length = 0;
-  }
   if(chan->opus.encoder != NULL){
     opus_encoder_destroy(chan->opus.encoder);
     chan->opus.encoder = NULL;
@@ -320,5 +314,5 @@ int demod_wfm(void *arg){
   delete_filter_output(&pilot);
   delete_filter_output(&chan->filter.out); // we don't use filter2
   chan->baseband = NULL;
-  return 0;
+  return chan->demod_type == INVALID_DEMOD ? -1 : 0;
 }

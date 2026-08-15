@@ -2,7 +2,6 @@
 
 // Receive and demux RTP PCM streams into a command pipeline
 // Copyright 2023 Phil Karn, KA9Q
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <math.h>
@@ -32,15 +31,15 @@
 
 struct session {
   struct session *prev;       // Linked list pointers
-  struct session *next; 
+  struct session *next;
   int type;                 // input RTP type (10,11)
-  
+
   struct sockaddr sender;
   char const *source;
 
   FILE *pipe;
   int64_t last_active;
- 
+
   struct rtp_state rtp_state; // RTP input state
 
   unsigned long dropped_samples;  // Dropped samples (stereo samples) replaced with silence
@@ -86,7 +85,7 @@ struct option Options[] =
    {NULL, 0, NULL, 0},
 
   };
-   
+
 char Optstring[] = "A:I:N:S:vV";
 
 struct sockaddr_storage Status_dest_address;
@@ -132,7 +131,7 @@ int main(int argc,char * const argv[]){
   }
   // This needs to be a proper macro expansion
   Command = argv[optind];
-  
+
   char iface[1024];
   if(Input){
     resolve_mcast(Input,&PCM_dest_address,DEFAULT_RTP_PORT,iface,sizeof(iface),0);
@@ -162,7 +161,6 @@ int main(int argc,char * const argv[]){
   // Graceful signal catch
   signal(SIGPIPE,closedown);
   signal(SIGINT,closedown);
-  signal(SIGKILL,closedown);
   signal(SIGQUIT,closedown);
   signal(SIGTERM,closedown);
   signal(SIGPIPE,SIG_IGN);
@@ -178,11 +176,11 @@ int main(int argc,char * const argv[]){
     pkt->next = NULL;
     pkt->data = NULL;
     pkt->len = 0;
-    
+
     struct sockaddr_storage sender;
     socklen_t socksize = sizeof(sender);
     int size = recvfrom(Input_fd,&pkt->content,sizeof(pkt->content),0,(struct sockaddr *)&sender,&socksize);
-    
+
     if(size == -1){
       if(errno != EINTR){ // Happens routinely, e.g., when window resized
 	perror("recvfrom");
@@ -192,7 +190,7 @@ int main(int argc,char * const argv[]){
     }
     if(size <= RTP_MIN_SIZE)
       continue; // Must be big enough for RTP header and at least some data
-    
+
     // Extract and convert RTP header to host format
     uint8_t const *dp = ntoh_rtp(&pkt->rtp,pkt->content);
     pkt->data = dp;
@@ -203,7 +201,7 @@ int main(int argc,char * const argv[]){
     }
     if(pkt->len <= 0)
       continue; // Used to be an assert, but would be triggered by bogus packets
-    
+
     // Find appropriate session; create new one if necessary
     struct session *sp = lookup_session((const struct sockaddr *)&sender,pkt->rtp.ssrc,pkt->rtp.type);
     if(!sp){
@@ -223,7 +221,7 @@ int main(int argc,char * const argv[]){
       // Channels
       // sample rate
       // sending IP address & port
-      
+
       char command_line[4096]; // I think that's the longest shell command
       int const samprate = samprate_from_pt(sp->type);
       int const channels = channels_from_pt(sp->type);
@@ -254,7 +252,7 @@ int main(int argc,char * const argv[]){
       if(samples_skipped < 4 * FULL_SAMPRATE){ // 4 sec @ 48kHz is arbitrary
 	sp->dropped_samples += samples_skipped;
 	int const padding = 2 * channels * samples_skipped;
-	
+
 	for(int i=0; i < padding; i++)
 	  fputc(0,sp->pipe);
       } else {
@@ -316,10 +314,10 @@ void * status(void *p){
 
       while(cp - buffer < length){
 	enum status_type const type = *cp++;
-	
+
 	if(type == EOL)
 	  break;
-	
+
 	unsigned int optlen = *cp++;
 	if(optlen & 0x80){
 	  // length is >= 128 bytes; fetch actual length from next N bytes, where N is low 7 bits of optlen
@@ -365,7 +363,7 @@ void * status(void *p){
 	    memcpy(&PCM_dest_address,&dest_temp,sizeof(dest_temp));
 	    pthread_cond_broadcast(&Input_ready_cond);
 	    pthread_mutex_unlock(&Input_ready_mutex);
-	    
+
 	    // Cancel timeouts and polls
 	    struct timeval timeout;
 	    timeout.tv_sec = 0;
@@ -415,7 +413,7 @@ struct session *create_session(void){
 
   struct session * const sp = calloc(1,sizeof(*sp));
   assert(sp != NULL); // Shouldn't happen on modern machines!
-  
+
   // Initialize entry
 
   // Put at head of list
@@ -431,7 +429,7 @@ struct session *create_session(void){
 
 int close_session(struct session *sp){
   assert(sp != NULL);
-  
+
   // Remove from linked list of sessions
   pthread_mutex_lock(&Session_protect);
   if(sp->next != NULL)

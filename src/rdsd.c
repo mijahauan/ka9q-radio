@@ -1,7 +1,6 @@
 // $Id: rdsd.c,v 1.5 2022/12/29 05:58:17 karn Exp $
 // FM RDS demodulator/decoder for ka9q-radio - rather primitive, not tested much
 // Copyright 2022-2023, Phil Karn, KA9Q
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <math.h>
@@ -207,7 +206,6 @@ int main(int argc,char * const argv[]){
   // Graceful signal catch
   signal(SIGPIPE,closedown);
   signal(SIGINT,closedown);
-  signal(SIGKILL,closedown);
   signal(SIGQUIT,closedown);
   signal(SIGTERM,closedown);
   signal(SIGPIPE,SIG_IGN);
@@ -399,12 +397,12 @@ void *decode(void *arg){
 
   // Narrow filter at 19 kHz for stereo pilot
   struct filter_out pilot;
-  create_filter_output(&pilot,&baseband,NULL,audio_L, COMPLEX);
+  create_filter_output(&pilot,&baseband,audio_L, COMPLEX);
   set_filter(&pilot,-100./Out_samprate, 100./Out_samprate, Kaiser_beta);
 
   // RDS info at 57 kHz = 19 kHz * 3
   struct filter_out rds;
-  create_filter_output(&rds,&baseband,NULL,audio_L, COMPLEX);
+  create_filter_output(&rds,&baseband,audio_L, COMPLEX);
   set_filter(&rds,-2000./Out_samprate, 2000./Out_samprate, Kaiser_beta);
 
   // Assume the remainder is zero, as it is for clean sample rates @ 200 Hz multiples

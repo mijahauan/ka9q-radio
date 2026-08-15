@@ -1,8 +1,6 @@
 // Multicast socket and network utility routines for ka9q-radio
 // Copyright 2018-2025 Phil Karn, KA9Q
 
-#define _GNU_SOURCE 1
-
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -440,6 +438,8 @@ char const *formatsock(void const *s,bool full){
   // Not in list yet
   struct inverse_cache * const ic = (struct inverse_cache *)calloc(1, sizeof(*ic));
   assert(ic != NULL); // Malloc failures are rare
+  if(ic == NULL)
+    return NULL;
   char host[NI_MAXHOST] = {0}, port[NI_MAXSERV] = {0}, hostname[NI_MAXHOST] = {0};
   getnameinfo(sa, slen,
 	      host, NI_MAXHOST,
@@ -837,6 +837,8 @@ static int setup_ipv6_loopback(int fd){
 // into the same Ethernet multicast MAC addresses as the 224.0.0.0/8 multicast control block
 // that is not snooped by switches
 uint32_t make_maddr(char const *arg){
+  if(arg == NULL || strlen(arg) == 0)
+    return 0;
   //  uint32_t addr = (239U << 24) | (ElfHashString(arg) & 0xffffff); // poor performance when last byte is always the same (.)
   uint32_t addr = (239U << 24) | (fnv1hash((uint8_t *)arg, strlen(arg)) & 0xffffff);
   // avoid 239.0.0.0/24 and 239.128.0.0/24 since they map to the same

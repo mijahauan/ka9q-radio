@@ -1,11 +1,11 @@
-#ifndef _AVAHI_H
-#include <avahi-client/client.h>
-#include <avahi-client/publish.h>
-#include <avahi-common/alternative.h>
-#include <avahi-common/simple-watch.h>
-#include <avahi-common/malloc.h>
-#include <avahi-common/error.h>
-#include <avahi-common/timeval.h>
+#ifndef AVAHI_H
+#define AVAHI_H 1
+
+// No Avahi library headers are needed here. avahi.c and avahi_browse.c
+// implement this interface by running the avahi-* command line tools, so no
+// Avahi type or symbol appears in either the interface or the implementation.
+#include <stdbool.h> // for Static_avahi
+#include <stdint.h>
 
 extern bool Static_avahi;
 
@@ -26,6 +26,6 @@ struct service_tab {
 int avahi_browse(struct service_tab *table,int tabsize,char const *service_name);
 void avahi_free_service_table(struct service_tab *table,int tabsize);
 
-int avahi_start(char const *service_name,char const *service_type,int service_port,char const *dns_name,int base_address,char const *description);
-#define AVAHI_H 1
+int avahi_start(char const *service_name,char const *service_type,int service_port,char const *dns_name,uint32_t base_address,char const *description);
+
 #endif

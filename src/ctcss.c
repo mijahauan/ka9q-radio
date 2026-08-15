@@ -1,7 +1,6 @@
 // ka9q-radio PL tone decoder
 // Reads multicast PCM audio (mono only right now)
 // Copyright Jan 2019 Phil Karn, KA9Q
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <complex.h>
@@ -208,7 +207,6 @@ int main(int argc,char * const argv[]){
   // Graceful signal catch
   signal(SIGPIPE,closedown);
   signal(SIGINT,closedown);
-  signal(SIGKILL,closedown);
   signal(SIGQUIT,closedown);
   signal(SIGTERM,closedown);
   signal(SIGPIPE,SIG_IGN);
@@ -280,7 +278,7 @@ int main(int argc,char * const argv[]){
 
 	//  200 ms @ 1500 Hz = 300 samples x 2 = 600 point FFT, 2.5 Hz bins, rotate by 10 hz increments
 	int pl_Filter_block = lrint(PL_samprate * Filter_time);
-	create_filter_output(&sp->pl_filter_out,&sp->filter_in,NULL,pl_Filter_block,COMPLEX);
+	create_filter_output(&sp->pl_filter_out,&sp->filter_in,pl_Filter_block,COMPLEX);
 	// Pass 50-300 Hz
 	// Kaiser beta = 11; kaiser alpha = 11/pi = 3.5; first null @ sqrt(1+alpha^2) = 3.64 bins * 5 Hz = 18.2 Hz
 	set_filter(&sp->pl_filter_out,(50. - PL_Shift)/PL_samprate,(300. - PL_Shift)/PL_samprate,Kaiser_beta);

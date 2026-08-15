@@ -1,12 +1,12 @@
 // signal generator - looks like a pseudo-front-end to radiod
 // Copyright Phil Karn, KA9Q, Aug 2023 KA9Q
-#define _GNU_SOURCE 1
 #include <complex.h>
 #include <math.h>
 #include <pthread.h>
 //#include <portaudio.h>
 #include <errno.h>
 #include <iniparser/iniparser.h>
+#include <string.h>
 #if defined(linux)
 #include <bsd/string.h>
 #include <bsd/stdlib.h>
@@ -71,7 +71,7 @@ double complex complex_gaussian(double);
 double real_gaussian(double);
 double sig_gen_tune(struct frontend * const frontend,double const freq);
 
-int sig_gen_setup(struct frontend * const frontend, dictionary * const dictionary, char const * const section){
+int sig_gen_setup(struct frontend * const frontend, dictionary const * const dictionary, char const * const section){
   assert(dictionary != NULL);
   {
     char const * const device = config_getstring(dictionary,section,"device",section);
@@ -350,7 +350,7 @@ static void *proc_sig_gen(void *arg){
     // to vary, causing the reported input level to bobble around the nominal value. Long refresh intervals with 'control'
     // will smooth this out, but it's annoying
 
-    if(blocksize != 0 && !isnan(in_energy) && isfinite(in_energy))
+    if(blocksize != 0 && isfinite(in_energy))
       frontend->if_power += Power_alpha * (in_energy / blocksize - frontend->if_power);
     {
       struct timespec ts = {

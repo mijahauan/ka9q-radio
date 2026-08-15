@@ -1,9 +1,6 @@
 // Generate UDP status messages from radiod, accept incoming commands to radiod in same format
 // Copyright 2023-2025 Phil Karn, KA9Q
-
-#define _GNU_SOURCE 1
 #include <assert.h>
-
 #include <stdint.h>
 #include <unistd.h>
 #include <limits.h>
@@ -31,8 +28,7 @@
 #include "multicast.h"
 #include "status.h"
 
-extern dictionary const *Preset_table;
-static unsigned long encode_radio_status(struct frontend const *frontend,struct channel *chan,uint8_t *packet, unsigned long len);
+static unsigned long encode_radio_status(struct frontend const *frontend,chan_t *chan,uint8_t *packet, unsigned long len);
 
 // Radio status reception and transmission thread
 void *radio_status(void *arg){
@@ -42,7 +38,7 @@ void *radio_status(void *arg){
   while(true){
     // Command from user
     uint8_t buffer[PKTSIZE];
-    ssize_t const length = recv(Ctl_fd,buffer,sizeof(buffer),0);
+    ssize_t const length = recv(Ctl_fd,buffer,sizeof buffer,0);
     if(length < 0){
       fprintf(stderr,"recv status: %s\n",strerror(errno));
       continue; // Should we exit?
@@ -51,66 +47,70 @@ void *radio_status(void *arg){
       continue; // short packet, or a response; ignore
 
     // for a specific ssrc?
-    uint32_t ssrc = get_ssrc(buffer+1,length-1);
+    uint32_t const ssrc = get_ssrc(buffer+1,length-1);
     switch(ssrc){
     case 0:
       // Ignore; reserved for dynamic channel template
       break;
-    case 0xffffffff:
+    case 0xffffffffu:
       // Ask all threads to dump their status in a staggered manner
+      pthread_mutex_lock(&Channel_list_mutex); // protect status entries
       for(int i=0; i < Nchannels; i++){
-	struct channel *chan = &Channel_list[i];
-	pthread_mutex_lock(&chan->status.lock);
-	if(chan->inuse && chan->output.rtp.ssrc != 0xffffffff && chan->output.rtp.ssrc != 0)
-	  chan->status.global_timer = (i >> 2) + 1; // four at a time
-	pthread_mutex_unlock(&chan->status.lock);
+	chan_t * const chan = &Channel_list[i];
+	if(chan->state == CHANNEL_RUNNING){
+	  pthread_mutex_lock(&chan->status.lock);   // nested locks -- any chance of a deadlock or priority inversion here?
+	  if(chan->output.rtp.ssrc != 0xffffffffu && chan->output.rtp.ssrc != 0)
+	    chan->status.global_timer = (i >> 2) + 1; // four at a time
+	  pthread_mutex_unlock(&chan->status.lock);
+	}
       }
+      pthread_mutex_unlock(&Channel_list_mutex);
       break;
     default:
       {
-	// find specific chan instance
-	struct channel *chan = lookup_chan(ssrc);
-	if(chan != NULL){
-	  // Channel already exists; queue the command for it to execute
-	  uint8_t *cmd = malloc(length-1);
-	  assert(cmd != NULL);
-	  memcpy(cmd,buffer+1,length-1);
-	  pthread_mutex_lock(&chan->status.lock);
-	  bool oops = true;
+	// find or create specific chan instance
+	chan_t * const chan = lookup_or_create_chan(ssrc,&Template);
+	if(chan == NULL){
+	  // Only happens when we can't create
+	  fprintf(stderr,"Dynamic create of ssrc %'u failed; is 'data =' set in [global]?\n",ssrc);
+	  break;
+	}
+	// We have the lock on chan->status.lock
+	switch(chan->state){
+	default:
+	  pthread_mutex_unlock(&chan->status.lock); // can't happen
+	  break;
+	case CHANNEL_STARTING:
+	  pthread_mutex_lock(&Channel_list_mutex);
+	  chan->state = CHANNEL_RUNNING;
+	  pthread_mutex_unlock(&Channel_list_mutex);
+	  start_demod(chan);
+	  if(Verbose)
+	    fprintf(stderr,"%s dynamically started\n",chan->name);
+	  [[fallthrough]];
+	case CHANNEL_RUNNING: /* fall through */
+	  // queue the command for it to execute
 	  for(int i=0; i < CQLEN; i++){
 	    if(chan->commands[i].buffer == NULL){
+	      uint8_t *cmd = malloc(length-1);
+	      assert(cmd != NULL);
+	      memcpy(cmd,buffer+1,length-1);
 	      chan->commands[i].buffer = cmd;
 	      chan->commands[i].length = length - 1;
-	      oops = false;
+	      cmd = NULL;
 	      break;
 	    }
 	  }
-	  pthread_mutex_unlock(&chan->status.lock);
-	  if(oops)
-	    FREE(cmd);
-	} else {
-	  // Channel doesn't yet exist. Create, execute the rest of this command here, and then start the new demod
-	  if((chan = create_chan(ssrc)) == NULL){ // possible race here?
-	    // Creation failed, e.g., no output stream
-	    fprintf(stderr,"Dynamic create of ssrc %'u failed; is 'data =' set in [global]?\n",ssrc);
-	  } else {
-	    chan->output.rtp.type = pt_from_info(chan->output.samprate,chan->output.channels,chan->output.encoding); // make sure it's initialized
-	    decode_radio_commands(chan,buffer+1,length-1);
-	    send_radio_status((struct sockaddr *)&chan->frontend->metadata_dest_socket,chan->frontend,chan); // Send status in response
-	    chan->status.global_timer = 0; // Just sent one
-	    start_demod(chan);
-	    if(Verbose)
-	      fprintf(stderr,"%u dynamically started\n",ssrc); // chan->name not set yet
-	  }
-	}
+	  pthread_mutex_unlock(&chan->status.lock); // release lock set by lookup_chan(), let demod run
+	  break;
+	} // send switch(chan->state)
       }
-      break;
-    }
-  }
+    } // end of switch(ssrc)
+  } // end of while(true)
   return NULL;
 }
 
-int send_radio_status(struct sockaddr const *sock,struct frontend const *frontend,struct channel *chan){
+int send_radio_status(struct sockaddr const *sock,struct frontend const *frontend,chan_t *chan){
   uint8_t packet[PKTSIZE];
   chan->status.packets_out++;
   unsigned long const len = encode_radio_status(frontend,chan,packet,sizeof(packet));
@@ -123,14 +123,17 @@ int send_radio_status(struct sockaddr const *sock,struct frontend const *fronten
   //    Then the status/data source ports may not match and the consume may think they're separate streams
   int const out_fd = (chan->output.ttl > 0) ? Output_fd : Output_fd0;
   socklen_t const slen = sock->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-  if(sendto(out_fd,packet,len,0,sock, slen) < 0)
+  if(sendto(out_fd,packet,len,0,sock, slen) < 0){
+    if(Verbose)
+      fprintf(stderr,"%s: error sending status: %s\n",chan->name,strerror(errno));
     chan->output.errors++;
+  }
 
   return 0;
 }
 
 // Return TRUE if a restart is needed, false otherwise
-bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length){
+bool decode_radio_commands(chan_t *chan,uint8_t const *buffer,int length){
   if(length < 2)
     return false;
 
@@ -166,9 +169,10 @@ bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length
     switch(type){
     case PRESET: // This should be processed before any other options, regardless of order in packet
       {
-	struct channel old = *chan; // Copy old to detect changes
+	chan_t old = *chan; // Copy old to detect changes
 	char *p = decode_string(cp,optlen);
-	strlcpy(chan->preset,p,sizeof(chan->preset));
+	if(p != NULL)
+	  strlcpy(chan->preset,p,sizeof(chan->preset));
 	FREE(p); // decode_string now allocs memory
 	if(Verbose > 1)
 	  fprintf(stderr,"%s loadpreset(%s)\n",chan->name,chan->preset);
@@ -176,12 +180,6 @@ bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length
 	  if(Verbose)
 	    fprintf(stderr,"%s loadpreset(%s) failed!\n",chan->name,chan->preset);
 	  break;
-	}
-	if(chan->filter.min_IF > chan->filter.max_IF){
-	  // Swap to ensure min <= max
-	  double const tmp = chan->filter.min_IF;
-	  chan->filter.min_IF = chan->filter.max_IF;
-	  chan->filter.max_IF = tmp;
 	}
 	if(old.tune.shift != chan->tune.shift)
 	  set_freq(chan,chan->tune.freq + chan->tune.shift - old.tune.shift);
@@ -533,27 +531,34 @@ bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length
 	  x = 1; // Minimum 1
 	if(x == chan->spectrum.fft_avg)
 	  break;
+	if(chan->spectrum.rbw > chan->spectrum.crossover && chan->spectrum.fft_n > 0){
+	  // Clip to amount available in the A/D ring buffer
+	  // Also limited in spectrum.c - belt and suspenders for now
+	  int limit = (int)floor(1 + ((chan->frontend->in.input_buffer_size / (sizeof (float) * chan->spectrum.fft_n)) - 1) / (1-chan->spectrum.overlap));
+	  if(x > limit)
+	    x = limit;
+	}
 	chan->spectrum.fft_avg = x;
       }
       break;
     case SPECTRUM_BASE:
       {
 	double x = decode_float(cp,optlen);
-	if(isfinite(x))
+	if(!isnan(x) && isfinite(x))
 	  chan->spectrum.base = x;
       }
       break;
     case SPECTRUM_STEP:
       {
 	double x = decode_float(cp,optlen);
-	if(isfinite(x))
+	if(!isnan(x) && isfinite(x))
 	  chan->spectrum.step = x;
       }
       break;
     case SPECTRUM_OVERLAP:
       {
 	double x = decode_float(cp, optlen);
-        if (x < 0 || x > 1)
+        if (isnan(x) || !isfinite(x) || x < 0 || x >= 1)
           break;
 	chan->spectrum.overlap = x;
       }
@@ -680,7 +685,7 @@ bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length
 
   if(restart_needed){
     if(Verbose > 1)
-      fprintf(stderr,"%s restarting\n",chan->name);
+      fprintf(stderr,"%s restart needed\n",chan->name);
     return true; // A new filter will also be needed but the demod will set that up
   }
   if(new_filter_needed){
@@ -695,7 +700,7 @@ bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length
 // Encode contents of frontend and chan structures as command or status packet
 // packet argument must be long enough!!
 // Convert values from internal to engineering units
-static unsigned long encode_radio_status(struct frontend const *frontend,struct channel *chan,uint8_t *packet, unsigned long len){
+static unsigned long encode_radio_status(struct frontend const *frontend,chan_t *chan,uint8_t *packet, unsigned long len){
   memset(packet,0,len);
   uint8_t *bp = packet;
 

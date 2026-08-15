@@ -3,7 +3,6 @@
 // set up and start hardware and convolver
 // Also provides entry points for channel creation and control for commands processed in radio_status.c
 // Copyright 2018-2025, Phil Karn, KA9Q
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <complex.h>
 #include <errno.h>
@@ -31,7 +30,6 @@
 #include <sys/types.h>
 #include <dirent.h>
 #include <pwd.h>
-#include <uuid/uuid.h>
 #include <fcntl.h>
 #include <sysexits.h>
 #include <ctype.h>
@@ -56,11 +54,10 @@
 #endif
 
 static int Total_channels;
-static bool Global_use_dns;
 static void *Dl_handle;
 static int const DEFAULT_IP_TOS = 46 << 2; // Expedited Forwarding
 static double const DEFAULT_BLOCKTIME = .02; // 20 ms
-static char *Metadata_dest_string; // DNS name of default multicast group for status/commands
+static char const *Metadata_dest_string; // DNS name of default multicast group for status/commands
 static pthread_t Status_thread;
 static dictionary *Configtable; // Configtable file descriptor for iniparser for main radiod config file
 static int SAP_enable = false;
@@ -69,7 +66,8 @@ static int const DEFAULT_UPDATE = 25; // 2 Hz for 20 ms blocktime (50 Hz frame r
 static int Update = DEFAULT_UPDATE;
 static int const DEFAULT_FFTW_THREADS = 1;
 static int const DEFAULT_FFTW_INTERNAL_THREADS = 1;
-static double const DEFAULT_LIFETIME = 0; // Infinite
+
+
 static int const DEFAULT_OVERLAP = 5;
 static double const Power_alpha = 0.10; // Noise estimation time smoothing factor, per block. Use double to reduce risk of slow denormals
 static double const NQ = 0.10; // look for energy in 10th quartile, hopefully contains only noise
@@ -77,17 +75,24 @@ static double const N_cutoff = 1.5; // Average (all noise, hopefully) bins up to
 // Minimum to get reasonable noise level statistics; 1000 * 40 Hz = 40 kHz which seems reasonable
 static int const Min_noise_bins = 1000;
 static char const *Iface;
-static char *Data;
-static int IP_tos = DEFAULT_IP_TOS;
+
 static char Preset_file[PATH_MAX];
 static char Hostname[256]; // can't use sysconf(_SC_HOST_NAME_MAX) at file scope
-static struct channel Template; // Template for dynamically created channels
-static pthread_mutex_t Channel_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+struct frontend Frontend = {
+  .status_mutex = PTHREAD_MUTEX_INITIALIZER,
+  .status_cond = PTHREAD_COND_INITIALIZER,
+};
+
+ // Template containing compiled-in defaults and global parameters
+chan_t Template;
+pthread_mutex_t Channel_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t Freq_mutex = PTHREAD_MUTEX_INITIALIZER;
-static _Atomic int Active_channel_count = ATOMIC_VAR_INIT(0); // Active channels
+static int Active_channel_count = 0;
 
 // List of valid config keys in [global] section, for error checking
 static char const *Global_keys[] = {
+  "advertise",
   "affinity",
   "blocktime",
   "data",
@@ -118,33 +123,28 @@ static char const *Global_keys[] = {
   NULL
 };
 
-struct frontend Frontend;
 
 // Remaining global variables are linked mostly from radio_status.c
 // Try to eliminate as many as possible
-struct channel Channel_list[Nchannels];
+chan_t Channel_list[Nchannels];
 double Blocktime = 0;      // Actual blocktime to give integral blocksize at input sample rate. Starts uninitialized
 double User_blocktime = DEFAULT_BLOCKTIME; // User's requested blocktime
 char const *Description; // Set either in [global] or [hardware]
 int Overlap = DEFAULT_OVERLAP;
-dictionary *Preset_table;   // Table of presets, usually in /usr/local/share/ka9q-radio/presets.conf
-bool Advertise; // control whether avahi advertises services
+dictionary const *Preset_table;   // Table of presets, usually in /usr/local/share/ka9q-radio/presets.conf. can be const because it's never closed
 
 int Output_fd = -1; // Unconnected socket used for output when ttl > 0
 int Output_fd0 = -1; // Unconnected socket used for local loopback when ttl = 0
 int Ctl_fd = -1;     // File descriptor for receiving user commands
 
-// If a channel is tuned to 0 Hz and then not polled for this many seconds, destroy it
-// Must be computed at run time because it depends on the block time
-int Channel_idle_timeout;  //  = DEFAULT_LIFETIME / Blocktime; (frames)
-
 extern char const *Name;     // owned by main.c
-
-static double estimate_noise(struct channel *chan,int shift);// Noise estimator tuning
+static double estimate_noise(chan_t *chan,int shift);// Noise estimator tuning
 static int setup_hardware(char const *sname);
 static void *process_section(void *p);
 static void *sap_send(void *p);
 static void *rtcp_send(void *p);
+static int close_chan(chan_t *chan);
+
 // Table of frequencies to start
 struct ftab {
   double f;
@@ -280,20 +280,19 @@ int loadconfig(char const *file){
   if(Configtable == NULL){
     return -1;
   }
+  // Process [global] section entries common to all demodulator blocks
   config_validate_section(stderr,Configtable,GLOBAL,Global_keys,Channel_keys);
-
-  // Process [global] section applying to all demodulator blocks
-  Description = config_getstring(Configtable,GLOBAL,"description",NULL);
+  // Description can also be set in hardware section, which will ovewrite this
+  Description = config_getstring(Configtable,GLOBAL,"description",Name);
+  strlcpy(Frontend.description,Description,sizeof Frontend.description);
   Verbose += config_getint(Configtable,GLOBAL,"verbose",0); // Add to the count of -v's on the command line
   {
-    double bt = fabs(config_getdouble(Configtable,GLOBAL,"blocktime",User_blocktime)); // Input value is in ms, internally in sec
+    double bt = fabs(config_getdouble(Configtable,GLOBAL,"blocktime",User_blocktime)); // seconds
     if (isnan(bt) || !isfinite(bt) || bt == 0.0)
       fprintf(stderr, "Block time %lf invalid, default %lf used\n", bt, User_blocktime);
     else
       User_blocktime = bt;
   }
-  double lifetime_sec = config_getdouble(Configtable, GLOBAL, "lifetime", DEFAULT_LIFETIME);
-  Channel_idle_timeout = lrint(lifetime_sec / User_blocktime);
   {
     int ol = abs(config_getint(Configtable,GLOBAL,"overlap",Overlap));
     if (ol < 2)
@@ -320,10 +319,12 @@ int loadconfig(char const *file){
     }
   }
   Update = config_getint(Configtable,GLOBAL,"update",Update);
-  IP_tos = config_getint(Configtable,GLOBAL,"tos",IP_tos);
-  Global_use_dns = config_getboolean(Configtable,GLOBAL,"dns",false);
+  int ttl = config_getint(Configtable,GLOBAL,"ttl",0);
+  int ip_tos = config_getint(Configtable,GLOBAL,"tos",DEFAULT_IP_TOS);
   Static_avahi = config_getboolean(Configtable,GLOBAL,"static",false);
   Affinity = config_getboolean(Configtable,GLOBAL,"affinity",false);
+  bool advertise = config_getboolean(Configtable,GLOBAL,"advertise",true);
+  bool const use_dns = config_getboolean(Configtable,GLOBAL,"dns",false);
   {
     static char default_wisdom_file[PATH_MAX];
     snprintf(default_wisdom_file,sizeof default_wisdom_file, "%s/%s",STATEDIR,"wisdom");
@@ -334,16 +335,22 @@ int loadconfig(char const *file){
     p = config_getstring(Configtable,GLOBAL,"presets-file",p);
     dist_path(Preset_file,sizeof(Preset_file),p);
     fprintf(stderr,"Loading presets file %s\n",Preset_file);
-    Preset_table = iniparser_load(Preset_file); // Kept open for duration of program
+    Preset_table = iniparser_load(Preset_file); // Kept open for duration of program, otherwise pointers are invalidated
     config_validate(stderr,Preset_table,Channel_keys,NULL);
     if(Preset_table == NULL){
       fprintf(stderr,"Can't load preset file %s\n",Preset_file);
       exit(EX_UNAVAILABLE); // Can't really continue without fixing
     }
   }
-
+  {
+    // The area pointed to by returns from config_getstring() is freed and overwritten when the config dictionary is closed
+    char const *p = config_getstring(Configtable,GLOBAL,"iface",Iface);
+    if(p != NULL){
+      // Duplicate it because p will go away when Configtable is closed
+      Default_mcast_iface = Iface = strdup(p);
+    }
+  }
   // Form default status dns name
-
   gethostname(Hostname,sizeof(Hostname));
   // Edit off .domain, .local, etc
   {
@@ -351,12 +358,44 @@ int loadconfig(char const *file){
     if(cp != NULL)
       *cp = '\0';
   }
-  char default_status[strlen(Hostname) + strlen(Name) + 20]; // Enough room for snprintf
-  snprintf(default_status,sizeof(default_status),"%s-%s.local",Hostname,Name);
+  // Set up status/command stream, global for all receiver channels
   {
-   char const *cp = config_getstring(Configtable,GLOBAL,"status",default_status); // Status/command target for all demodulators
+    char default_status[strlen(Hostname) + strlen(Name) + 20]; // Enough room for snprintf
+    snprintf(default_status,sizeof(default_status),"%s-%s.local",Hostname,Name);
+    char const *cp = config_getstring(Configtable,GLOBAL,"status",default_status); // Status/command target for all demodulators
     // Add .local if not present
-   Metadata_dest_string = ensure_suffix(cp,".local");
+    Metadata_dest_string = ensure_suffix(cp,".local"); // allocates copy
+  }
+  // If enabled, look quickly (2 tries max) to see if the status group name is already in the DNS
+  // Otherwise
+  if(!use_dns || resolve_mcast(Metadata_dest_string,(struct sockaddr *)&Frontend.metadata_dest_socket,
+		      DEFAULT_STAT_PORT,NULL,0,2) != 0){
+    // Generate an IPv4 address by hashing the name
+    struct sockaddr_in *sin = (struct sockaddr_in *)&Frontend.metadata_dest_socket;
+    uint32_t addr = make_maddr(Metadata_dest_string);
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = htonl(addr);
+    sin->sin_port = htons(DEFAULT_STAT_PORT);
+  }
+  // Set up two output sockets for ttl != 0 and ttl == 0
+  /* The ttl in the [global] section is used for any dynamic
+     data channels. It is the default for static data channels unless
+     overridden in each section. Note that when a section specifies a
+     non-zero TTL, the global setting is actually used so the section TTLs could as well be booleans.
+     It's too tedious and not very useful to manage a whole bunch of sockets with arbitrary
+     TTLs. 0 and 1 are most useful.
+     At the moment, elicited status messages are always sent with TTL > 0 on the status group
+  */
+  Output_fd = output_mcast(&Frontend.metadata_dest_socket, Iface, 1, ip_tos); // non-zero; should we support a user specified value?
+  if(Output_fd < 0)
+    fprintf(stderr,"can't create output socket(s): %s\n",strerror(errno));
+
+  Output_fd0 = output_mcast(&Frontend.metadata_dest_socket, Iface, 0, ip_tos);
+  if(Output_fd0 < 0){
+    fprintf(stderr,"can't create output socket(s): %s\n",strerror(errno));
+
+    if(Output_fd < 0 || Output_fd0 < 0)
+      exit(EX_NOHOST); // let systemd restart us
   }
   // Set up the hardware early, in case it fails
   const char *hardware = config_getstring(Configtable,GLOBAL,"hardware",NULL);
@@ -383,149 +422,38 @@ int loadconfig(char const *file){
       exit(EX_USAGE);
     }
   }
-  if(strlen(Frontend.description) == 0)
-    strlcpy(Frontend.description,Name,sizeof(Frontend.description)); // Set default description
-
-  // Default multicast interface
-  {
-    // The area pointed to by returns from config_getstring() is freed and overwritten when the config dictionary is closed
-    char const *p = config_getstring(Configtable,GLOBAL,"iface",Iface);
-    if(p != NULL){
-      Iface = strdup(p);
-      Default_mcast_iface = Iface;
+  // Wait until hardware section has been parsed in case it sets Description
+  if(advertise){
+    // fix this to handle IPv6 too!
+    struct sockaddr_in *sin = (struct sockaddr_in *)&Frontend.metadata_dest_socket;
+    if(sin->sin_family == AF_INET){
+      uint32_t addr = ntohl(sin->sin_addr.s_addr);
+      // If dns name already exists in the DNS, advertise the service record but not an address record
+      char ttlmsg[128];
+      snprintf(ttlmsg,sizeof ttlmsg,"TTL=%d",ttl);
+      avahi_start(Description,"_ka9q-ctl._udp",DEFAULT_STAT_PORT,
+		  Metadata_dest_string,addr,ttlmsg);
     }
   }
-  // Overrides in [global] of compiled-in defaults
-  {
-    char data_default[256];
-    snprintf(data_default,sizeof(data_default),"%s-pcm.local",Name);
-    char const *cp = config_getstring(Configtable,GLOBAL,"data",data_default);
-    // Add .local if not present
-    Data = ensure_suffix(cp,".local");
-  }
-  // Set up template for all new channels
-  set_defaults(&Template);
-  Template.frontend = &Frontend;
   assert(Blocktime != 0);
-  Template.lifestart = Template.lifetime = Channel_idle_timeout;
-
-  // Set up default output stream file descriptor and socket
-  // There can be multiple senders to an output stream, so let avahi suppress the duplicate addresses
-  strlcpy(Template.output.dest_string,Data,sizeof(Template.output.dest_string));
-
-  // Preset/mode must be specified to create a dynamic channel
+  set_defaults(&Template);
   // (Trying to switch from term "mode" to term "preset" as more descriptive)
+  // Load preset first, then load options in global section that may modify them
   char const * p = config_getstring(Configtable,GLOBAL,"preset","am"); // Hopefully "am" is defined in presets.conf
   char const * preset = config_getstring(Configtable,GLOBAL,"mode",p); // Must be specified to create a dynamic channel
   if(preset != NULL){
     if(loadpreset(&Template,Preset_table,preset) != 0)
-      fprintf(stderr,"warning: loadpreset(%s,%s) in [global]\n",Preset_file,preset);
+      fprintf(stderr,"warning: loadpreset(%s,%s) failed\n",Preset_file,preset);
     strlcpy(Template.preset,preset,sizeof(Template.preset));
-
-    loadpreset(&Template,Configtable,GLOBAL); // Overwrite with other entries from this section, without overwriting those
-  } else {
-    fprintf(stderr,"No default mode for template\n");
   }
-
-  /* The ttl in the [global] section is used for any dynamic
-     data channels. It is the default for static data channels unless
-     overridden in each section. Note that when a section specifies a
-     non-zero TTL, the global setting is actually used so the section TTLs could as well be booleans.
-     It's too tedious and not very useful to manage a whole bunch of sockets with arbitrary
-     TTLs. 0 and 1 are most useful.
-     At the moment, elicited status messages are always sent with TTL > 0 on the status group
-  */
-
-  {
-    // Look quickly (2 tries max) to see if it's already in the DNS
-
-    uint32_t addr = 0;
-    if(!Global_use_dns || resolve_mcast(Data,&Template.output.dest_socket,DEFAULT_RTP_PORT,NULL,0,2) != 0)
-      addr = make_maddr(Data);
-
+  loadpreset(&Template,Configtable,GLOBAL); // Overwrite with other entries from this section, without overwriting those
+  if(Template.advertise){
+    char ttlmsg[128];
+    snprintf(ttlmsg,sizeof(ttlmsg),"TTL=%d",Template.output.ttl);
+    // Advertise dynamic service(s)
     struct sockaddr_in *sin = (struct sockaddr_in *)&Template.output.dest_socket;
-    sin->sin_family = AF_INET;
-    sin->sin_addr.s_addr = htonl(addr);
-    sin->sin_port = htons(DEFAULT_RTP_PORT);
-
-    // Status sent to same group, different port
-    sin = (struct sockaddr_in *)&Template.status.dest_socket;
-    sin->sin_family = AF_INET;
-    sin->sin_addr.s_addr = htonl(addr);
-    sin->sin_port = htons(DEFAULT_STAT_PORT);
-
-    Advertise = config_getboolean(Configtable,GLOBAL,"advertise",true);
-
-    if(Advertise){
-      char ttlmsg[128];
-      snprintf(ttlmsg,sizeof(ttlmsg),"TTL=%d",Template.output.ttl);
-      // Advertise dynamic service(s)
-      avahi_start(Frontend.description,
-		  "_rtp._udp",
-		  DEFAULT_RTP_PORT,
-		  Data,
-		  addr,
-		  ttlmsg);
-
-    }
+    avahi_start(Description, "_rtp._udp", DEFAULT_RTP_PORT, Template.output.dest_string, ntohl(sin->sin_addr.s_addr), ttlmsg);
   }
-  {
-    // Non-zero TTL streams use the global ttl if it is nonzero, 1 otherwise
-    int const ttl = Template.output.ttl > 1 ? Template.output.ttl : 1;
-
-    Output_fd = output_mcast(&Template.output.dest_socket,Iface,ttl,IP_tos);
-    if(Output_fd < 0){
-      fprintf(stderr,"can't create output socket for TTL=%d: %s\n",ttl,strerror(errno));
-      exit(EX_NOHOST); // let systemd restart us
-    }
-  }
-  join_group(Output_fd,NULL,(struct sockaddr *)&Template.output.dest_socket,Iface); // Work around snooping switch problem
-  // Secondary output socket with ttl = 0
-  Output_fd0 = output_mcast((struct sockaddr *)&Template.output.dest_socket,Iface,0,IP_tos);
-  if(Output_fd0 < 0){
-    fprintf(stderr,"can't create output socket for TTL=0: %s\n",strerror(errno));
-    exit(EX_NOHOST); // let systemd restart us
-  }
-
-  // Set up status/command stream, global for all receiver channels
-  if(0 == strcmp(Metadata_dest_string,Data)){
-    fprintf(stderr,"Duplicate status/data stream names: data=%s, status=%s\n",Data,Metadata_dest_string);
-    exit(EX_USAGE);
-  }
-  // Look quickly (2 tries max) to see if it's already in the DNS
-
-  {
-    uint32_t addr = 0;
-    if(!Global_use_dns || resolve_mcast(Metadata_dest_string,
-					(struct sockaddr *)&Frontend.metadata_dest_socket,
-					DEFAULT_STAT_PORT,NULL,0,2) != 0)
-      addr = make_maddr(Metadata_dest_string);
-
-    struct sockaddr_in *sin = (struct sockaddr_in *)&Frontend.metadata_dest_socket;
-    sin->sin_family = AF_INET;
-    sin->sin_addr.s_addr = htonl(addr);
-    sin->sin_port = htons(DEFAULT_STAT_PORT);
-
-    if(Advertise) {
-      // If dns name already exists in the DNS, advertise the service record but not an address record
-      // Advertise control/status channel with a ttl of at least 1
-      char ttlmsg[128];
-      snprintf(ttlmsg,sizeof ttlmsg,"TTL=%d",Template.output.ttl > 0? Template.output.ttl : 1);
-      avahi_start(Frontend.description,"_ka9q-ctl._udp",DEFAULT_STAT_PORT,
-		  Metadata_dest_string,addr,ttlmsg);
-    }
-  }
-  // either resolve_mcast() or avahi_start() has resolved the target DNS name into Frontend.metadata_dest_socket and inserted the port number
-  join_group(Output_fd,NULL,(struct sockaddr *)&Frontend.metadata_dest_socket,Iface);
-  // Same remote socket as status
-  Ctl_fd = listen_mcast(NULL,&Frontend.metadata_dest_socket,Iface);
-  if(Ctl_fd < 0){
-    fprintf(stderr,"can't listen for commands from %s: %s; no control channel is set\n",Metadata_dest_string,strerror(errno));
-  } else {
-    if(Ctl_fd >= 3)
-      pthread_create(&Status_thread,NULL,radio_status,NULL);
-  }
-
   // Process individual demodulator sections in parallel for speed
   int const nsect = iniparser_getnsec(Configtable);
   pthread_t startup_threads[nsect];
@@ -550,6 +478,14 @@ int loadconfig(char const *file){
 #if 0
     fprintf(stderr,"startup thread %s joined\n",iniparser_getsecname(Configtable,sect));
 #endif
+  }
+  // Same remote socket as status
+  Ctl_fd = listen_mcast(NULL,&Frontend.metadata_dest_socket,Iface);
+  if(Ctl_fd < 0){
+    fprintf(stderr,"can't listen for commands from %s: %s; no control channel is set\n",Metadata_dest_string,strerror(errno));
+  } else {
+    if(Ctl_fd >= 3)
+      pthread_create(&Status_thread,NULL,radio_status,NULL);
   }
   iniparser_freedict(Configtable);
   Configtable = NULL;
@@ -577,6 +513,7 @@ static int setup_hardware(char const *sname){
       return -1;
     }
     fprintf(stderr,"Dynamically loading %s hardware driver from %s\n",device,dlname);
+    // Do not close - must remain open for symbols to be valid
     Dl_handle = dlopen(dlname,RTLD_GLOBAL|RTLD_NOW);
     if(Dl_handle == NULL){
       char *error = dlerror();
@@ -601,25 +538,33 @@ static int setup_hardware(char const *sname){
     }
     snprintf(symname,sizeof(symname),"%s_shutdown",device);
     Frontend.shutdown = dlsym(Dl_handle,symname);
-    if(Verbose && (error = dlerror()) != NULL)
-      fprintf(stderr,"no %s_shutdown symbol: %s\n",device,error);
-
+    if((error = dlerror()) != NULL){
+      Frontend.shutdown = NULL;
+      if(Verbose)
+	fprintf(stderr,"no %s_shutdown symbol: %s\n",device,error);
+    }
     snprintf(symname,sizeof(symname),"%s_tune",device);
     Frontend.tune = dlsym(Dl_handle,symname);
     if((error = dlerror()) != NULL){
       // Not fatal, but no tuning possible
+      Frontend.tune = NULL;
       fprintf(stderr,"warning: symbol %s not found in %s for %s: %s\n",symname,dlname,device,error);
     }
     // No error checking on these, they're optional
     snprintf(symname,sizeof(symname),"%s_gain",device);
     Frontend.gain = dlsym(Dl_handle,symname);
-    if(Verbose && (error = dlerror()) != NULL) // Not serious errors
-      fprintf(stderr,"no %s_gain symbol: %s\n",device,error);
-
+    if((error = dlerror()) != NULL){
+      Frontend.gain = NULL;
+      if(Verbose) // Not serious errors
+	fprintf(stderr,"no %s_gain symbol: %s\n",device,error);
+    }
     snprintf(symname,sizeof(symname),"%s_atten",device);
     Frontend.atten = dlsym(Dl_handle,symname);
-    if(Verbose && (error = dlerror()) != NULL)
-      fprintf(stderr,"no %s_atten symbol: %s\n",device,error);
+    if((error = dlerror()) != NULL){
+      Frontend.atten = NULL;
+      if(Verbose)
+	fprintf(stderr,"no %s_atten symbol: %s\n",device,error);
+    }
   }
   int r = (*Frontend.setup)(&Frontend,Configtable,sname);
   if(r != 0){
@@ -640,8 +585,8 @@ static int setup_hardware(char const *sname){
   assert(Frontend.L != 0);
   int const N = Frontend.M + Frontend.L - 1;
   Blocktime = Frontend.L / Frontend.samprate; // True value, must be set early, many things depend on it
-  if(fabs(Blocktime - User_blocktime) > 1e-6)
-    fprintf(stderr,"Warning: requested block time %lf changed to %lf for integral block size %d at sample rate %lf Hz\n",
+  if(fabs(Blocktime / User_blocktime - 1) > 1e-15)
+    fprintf(stderr,"Warning: requested block time %.15lg s changed to %.15lg s for integral block size %d at sample rate %lf Hz\n",
 	    User_blocktime,Blocktime,Frontend.L,Frontend.samprate);
 
   fprintf(stderr,"Block time %.3lf ms, block samples L=%'d, overlap %d (%.1lf%%) M-1=%'d samples, forward FFT size N=%'u %s\n",
@@ -657,94 +602,51 @@ static int setup_hardware(char const *sname){
   struct notch_state *notch = Frontend.in.notches;
   if(notch == NULL){
     fprintf(stderr,"calloc failed in notch filter setup\n");
-    // Will probably crash later, but try to keep going
-  } else {
-    // Initialize spur list. MUST leave last entry zeroed as sentinel; also doubles as 0 Hz (DC) suppression
-    for(int i = 0; i < NSPURS; i++){
-      int shift;
-      double remainder; // Offset from bin center, Hz, e.g, -20 to +20. Or is it -25 to +25?
-      int r = compute_tuning(N,Frontend.M,Frontend.samprate,&shift,&remainder,Frontend.spurs[i]);
-      if(r != 0)
-	break;
-      notch->state = 0;
-      notch->bin = abs(shift);
-      notch->alpha = .01; //  About 10 sec. Arbitrary, make adaptive.
-      if(shift == 0) // DC is implicitly last
-	break;
-      notch++;
-    }
+    return 0;
   }
-  pthread_mutex_init(&Frontend.status_mutex,NULL);
-  pthread_cond_init(&Frontend.status_cond,NULL);
+  // Initialize spur list. MUST leave last entry zeroed as sentinel; also doubles as 0 Hz (DC) suppression
+  for(int i = 0; i < NSPURS; i++){
+    int shift;
+    double remainder; // Offset from bin center, Hz, e.g, -20 to +20. Or is it -25 to +25?
+    int r = compute_tuning(N,Frontend.M,Frontend.samprate,&shift,&remainder,Frontend.spurs[i]);
+    if(r != 0)
+      break;
+    notch->state = 0;
+    notch->bin = abs(shift);
+    notch->alpha = .01; //  About 10 sec. Arbitrary, make adaptive.
+    if(shift == 0) // DC is implicitly last
+      break;
+    notch++;
+  }
   return 0;
 }
 
 // called by loadconfig() to process one receiver section of a config file
-static void *process_section(void *p){
-  char const *sname = (char *)p;
+static void *process_section(void *arg){
+  char const *sname = (char *)arg;
   if(sname == NULL)
     return NULL;
 
   config_validate_section(stderr,Configtable,sname,Channel_keys,NULL);
 
-  // fall back to setting in [global] if parameter not specified in individual section
-  // Set parameters even when unused for the current demodulator in case the demod is changed later
-  char const * preset = config2_getstring(Configtable,Configtable,GLOBAL,sname,"mode",NULL);
-  preset = config2_getstring(Configtable,Configtable,GLOBAL,sname,"preset",preset);
-  if(preset == NULL || strlen(preset) == 0)
-    fprintf(stderr,"[%s] preset/mode not specified, all parameters must be explicitly set\n",sname);
-
-  // Override [global] settings with section settings
-  char const *data = NULL;
-  {
-    char const *cp = config_getstring(Configtable,sname,"data",Data);
-    // Add .local if not present
-    data = ensure_suffix(cp,".local");
-  }
-
   // Set up a template for all channels defined in this section
   // Parameter priority, from high to low:
-  // 1. this section
-  // 2. the preset database entry, if specified
-  // 3. the [global] section
+  // 1. settings in this section
+  // 2. a preset in this section, if specified
+  // 3. the [global] section: a preset (if any) modified by global settings
   // 4. compiled-in defaults to keep things from blowing up
-  struct channel chan_template = {
-    .frontend = &Frontend
-  };
-  set_defaults(&chan_template); // compiled-in defaults (#4)
-  loadpreset(&chan_template,Configtable,GLOBAL); // [global] section (#3)
-  if(loadpreset(&chan_template,Preset_table,preset) != 0) // preset database entry (#2)
-    fprintf(stderr,"[%s] loadpreset(%s,%s) failed; compiled-in defaults and local settings used\n",sname,Preset_file,preset);
-
-  strlcpy(chan_template.preset,preset,sizeof chan_template.preset);
-  loadpreset(&chan_template,Configtable,sname); // this section's config (#1)
-
-  if(chan_template.output.ttl != 0 && Template.output.ttl != 0)
-    chan_template.output.ttl = Template.output.ttl; // use global ttl when both are non-zero
-
-  // There can be multiple senders to an output stream, so let avahi suppress the duplicate addresses
-  // Look quickly (2 tries max) to see if it's already in the DNS. Otherwise make a multicast address.
-  uint32_t addr = 0;
-  bool const use_dns = config_getboolean(Configtable,sname,"dns",Global_use_dns);
-  bool const enable_section_adv = config_getboolean(Configtable,sname,"advertise",Advertise);
-
-  if(!use_dns || resolve_mcast(data,&chan_template.output.dest_socket,DEFAULT_RTP_PORT,NULL,0,2) != 0)
-    // If we're not using the DNS, or if resolution fails, hash name string to make IP multicast address in 239.x.x.x range
-    addr = make_maddr(data);
-
-  {
-    struct sockaddr_in *sock = (struct sockaddr_in *)&chan_template.output.dest_socket;
-    sock->sin_family = AF_INET;
-    sock->sin_addr.s_addr = htonl(addr);
-    sock->sin_port = htons(DEFAULT_RTP_PORT);
-
-    // Status sent to same group, different port
-    sock = (struct sockaddr_in *)&chan_template.status.dest_socket;
-    sock->sin_family = AF_INET;
-    sock->sin_addr.s_addr = htonl(addr);
-    sock->sin_port = htons(DEFAULT_STAT_PORT);
+  chan_t chan_template = Template; // compiled defaults + [global] settings
+  char const * p = config_getstring(Configtable,sname,"preset",NULL); // no default here so we'll pick up the global default in Template
+  char const * preset = config_getstring(Configtable,sname,"mode",p); // Must be specified to create a dynamic channel
+  if(preset != NULL){
+    if(loadpreset(&chan_template,Preset_table,preset) != 0)
+      fprintf(stderr,"warning: loadpreset(%s,%s) failed\n",Preset_file,preset);
+    strlcpy(chan_template.preset,preset,sizeof(chan_template.preset));
   }
-  if(enable_section_adv) {
+  loadpreset(&chan_template,Configtable,sname);
+  struct sockaddr_in *sock = (struct sockaddr_in *)&chan_template.output.dest_socket;
+
+  if(chan_template.advertise && sock->sin_family == AF_INET) {
     // there may be several hosts with the same section names
     // prepend the host name to the service name
     char service_name[512] = {0};
@@ -756,25 +658,14 @@ static void *process_section(void *p){
     avahi_start(service_name,
 		is_opus ? "_opus._udp" : "_rtp._udp",
 		DEFAULT_RTP_PORT,
-		data,addr,ttlmsg);
+		chan_template.output.dest_string,
+		ntohl(sock->sin_addr.s_addr),ttlmsg);
   }
-
   // Set up output stream (data + status)
   // data stream is shared by all channels in this section
   // Now also used for per-channel status/control, with different port number
   chan_template.status.dest_socket = chan_template.output.dest_socket;
   setport(&chan_template.status.dest_socket,DEFAULT_STAT_PORT);
-  strlcpy(chan_template.output.dest_string,data,sizeof chan_template.output.dest_string);
-  {
-    int pt = pt_from_info(chan_template.output.samprate,chan_template.output.channels,chan_template.output.encoding);
-    if(pt == -1){
-      fprintf(stderr,"channel template: can't allocate payload type for samprate %'d, channels %d, encoding %d\n",
-	      chan_template.output.samprate,chan_template.output.channels,chan_template.output.encoding); // make sure it's initialized
-	  return -1;
-    }
-    chan_template.output.rtp.type = pt;
-  }
-
   char const *iface = NULL;
   if(chan_template.output.ttl != 0){
     // Override global defaults
@@ -919,11 +810,11 @@ static void *process_section(void *p){
 
     uint32_t ssrc = lrint(freq_table[i].f / 1000.0); // Kilohertz
 
-    struct channel *chan = NULL;
+    chan_t *chan = NULL;
     // Try to create it, incrementing in case of collision
     int const max_collisions = 100;
     for(int i=0; i < max_collisions; i++,ssrc++){
-      chan = create_chan(ssrc);
+      chan = lookup_or_create_chan(ssrc,&chan_template); // this locks the entry if successful
       if(chan != NULL)
 	break;
     }
@@ -931,14 +822,18 @@ static void *process_section(void *p){
       fprintf(stderr,"Can't allocate requested ssrc in range %u-%u\n",ssrc-max_collisions,ssrc);
       continue;
     }
-    // Initialize from template, set frequency and start
-    // Be careful with shallow copies like this; although the pointers in the channel structure are still NULL
-    // the ssrc and inuse fields are active and must be cleaned up. Are there any others...?
-    *chan = chan_template;
-    chan->output.rtp.ssrc = ssrc; // restore after template copy
+    if(chan->state != CHANNEL_STARTING){
+      pthread_mutex_unlock(&chan->status.lock);
+      continue; // Already created?
+    }
+    // Set channel-specific fields
     snprintf(chan->name, sizeof chan->name, "%s %u", demod_name_from_type(chan->demod_type), chan->output.rtp.ssrc);
     chan->fm.tone_freq = freq_table[i].tone;
     set_freq(chan,freq_table[i].f);
+    pthread_mutex_unlock(&chan->status.lock);
+    pthread_mutex_lock(&Channel_list_mutex);
+    chan->state = CHANNEL_RUNNING;
+    pthread_mutex_unlock(&Channel_list_mutex);
     start_demod(chan);
     Total_channels++;
     section_chans++;
@@ -962,68 +857,56 @@ static void *process_section(void *p){
   fprintf(stderr,"[%s] %d channel%s started\n",sname,section_chans,section_chans != 1 ? "s" : "");
   return NULL;
 }
-// Find chan by ssrc
-struct channel *lookup_chan(uint32_t ssrc){
-  struct channel *chan = NULL;
-  pthread_mutex_lock(&Channel_list_mutex);
-  for(int i=0; i < Nchannels; i++){
-    if(Channel_list[i].inuse && Channel_list[i].output.rtp.ssrc == ssrc){
-      chan = &Channel_list[i];
-      break;
-    }
-  }
-  pthread_mutex_unlock(&Channel_list_mutex);
-  return chan;
-}
-
-
-// Atomically create chan only if the ssrc doesn't already exist
-struct channel *create_chan(uint32_t ssrc){
-  if(ssrc == 0xffffffff)
+// Atomically find chan by ssrc, or create and initialize if it doesn't already exist
+// ! LOCKS the channel status !
+chan_t *lookup_or_create_chan(uint32_t ssrc,chan_t const *template){
+  if(ssrc == 0xffffffffu)
     return NULL; // reserved
-  pthread_mutex_lock(&Channel_list_mutex);
+
+  pthread_mutex_lock(&Channel_list_mutex); // protect state
+  int first_unused = -1;
   for(int i=0; i < Nchannels; i++){
-    if(Channel_list[i].inuse && Channel_list[i].output.rtp.ssrc == ssrc){
+    chan_t *chan = &Channel_list[i];
+    if(chan->state == CHANNEL_IDLE){
+      if(first_unused == -1)
+	first_unused = i; // Note first unused entry in case we need it
+      continue;
+    }
+    if(chan->state == CHANNEL_RUNNING && chan->output.rtp.ssrc == ssrc){
+      // Found existing channel
+      pthread_mutex_lock(&chan->status.lock);
       pthread_mutex_unlock(&Channel_list_mutex);
-      return NULL; // sorry, already taken
+      return chan; // Return locked existing channel
     }
   }
-  // Find first unused channel entry
-  struct channel *chan = NULL;
-  for(int i=0; i < Nchannels; i++){
-    if(!Channel_list[i].inuse){
-      chan = &Channel_list[i];
-      break;
-    }
+  // Not found
+  if(first_unused == -1){
+    // table full!
+    pthread_mutex_unlock(&Channel_list_mutex);
+    return NULL;
   }
-  if(chan == NULL){
-    fprintf(stderr,"Warning: out of chan table space (%'d)\n",Active_channel_count);
-    // Abort here? Or keep going?
-  } else {
-    assert(Blocktime != 0);
-    // Because the memcpy clobbers the ssrc, we must keep the lock held on Channel_list_mutex
-    *chan = Template; // Template.inuse is already set
-    chan->frontend = &Frontend; // Should be already set in template, but just be sure
-    chan->output.rtp.ssrc = ssrc; // Stash it
-    chan->lifetime = 0; // unlimited by default
-    int c = atomic_fetch_add(&Active_channel_count,1);
-    if(c == 0){
-      // First channel created, start front end
-      assert(Frontend.start != NULL);
-      int r = (*Frontend.start)(&Frontend);
-      if(r != 0)
-	fprintf(stderr,"Front end start returned %d\n",r);
-    }
+  // Use first unused entry
+  chan_t *chan = &Channel_list[first_unused];
+  assert(chan->state == CHANNEL_IDLE);
+  memcpy(chan,template,sizeof *chan);
+  chan->output.rtp.ssrc = ssrc;
+  chan->state = CHANNEL_STARTING;
+  pthread_mutex_init(&chan->status.lock,NULL);
+  pthread_mutex_lock(&chan->status.lock);
+  int c = Active_channel_count++;
+  if(c == 0){
+    // First channel created, start front end
+    assert(Frontend.start != NULL);
+    int r = (*Frontend.start)(&Frontend);
+    if(r != 0)
+      fprintf(stderr,"Front end start returned %d\n",r);
   }
   pthread_mutex_unlock(&Channel_list_mutex);
-  return chan;
+  return chan; // lock on chan->status.lock still held
 }
-
-
-
 static void *demod_thread(void *p){
   assert(p != NULL);
-  struct channel *chan = (struct channel *)p;
+  chan_t *chan = (chan_t *)p;
   if(chan == NULL)
     return NULL;
 
@@ -1032,13 +915,15 @@ static void *demod_thread(void *p){
   // Repeatedly invoke appropriate demodulator
   // When a demod exits, the appropriate one is restarted,
   // which can be the same one if demod_type hasn't changed
-  // A demod can terminate completely by setting an invalid demod_type and exiting
+  // A demod can terminate completely by setting an invalid demod_type and returning
+  // Eg, downconvert() does this when a channel lifetime counts down to 0
   int status = 0;
-  while(status == 0){ // A demod returns non-zero to signal a fatal error, don't restart
+  do {
     snprintf(chan->name, sizeof chan->name, "%s %u", demod_name_from_type(chan->demod_type), chan->output.rtp.ssrc);
     pthread_setname(chan->name);
+
     if(Verbose > 1)
-      fprintf(stderr,"%s freq %'.3lf Hz starting\n",chan->name,chan->tune.freq);
+      fprintf(stderr,"%s starting\n",chan->name);
 
     switch(chan->demod_type){
     case LINEAR_DEMOD:
@@ -1054,17 +939,22 @@ static void *demod_thread(void *p){
     case SPECT2_DEMOD: // Same task, output is formatted differently
       status = demod_spectrum(p);
       break;
+    case IDLE_DEMOD:
+      status = demod_idle(p);
+      break;
     default:
       status = -1; // Unknown demod, quit
       break;
     }
-  }
+  } while(chan->demod_type != INVALID_DEMOD && status == 0);
+  // The channels should already clean up after themselves, but just in case...
+  if(Verbose > 1)
+    fprintf(stderr,"chan %u exiting\n",chan->output.rtp.ssrc);
   close_chan(chan);
   return NULL;
 }
-
 // start demod thread on already-initialized chan structure
-int start_demod(struct channel * chan){
+int start_demod(chan_t * chan){
   assert(chan != NULL);
   if(chan == NULL)
     return -1;
@@ -1077,14 +967,62 @@ int start_demod(struct channel * chan){
   pthread_create(&chan->demod_thread,NULL,demod_thread,chan);
   return 0;
 }
-
-// Called by a demodulator to clean up its own resources
-int close_chan(struct channel *chan){
+// Idle demod, only processes commands
+int demod_idle(void *arg){
+  chan_t * const chan = arg;
+  assert(chan != NULL);
   if(chan == NULL)
+    return -1; // in case asserts are off
+
+  do {
+    // We don't call downconvert() so we must decrement the lifetime ourselves
+    // and sleep a block time every iteration
+    if(chan->lifetime > 0 && --chan->lifetime <= 0){
+      // channel timed out
+      chan->demod_type = INVALID_DEMOD;  // No demodulator
+      if(Verbose > 1)
+	fprintf(stderr,"%s timeout\n",chan->name);
+      break;
+    }
+    bool restart_needed = false;
+    bool response_needed = false;
+    pthread_mutex_lock(&chan->status.lock);
+    // Look on the command queue and grab just one atomically
+    for(int i=0;i < CQLEN; i++){
+      if(chan->commands[i].buffer != NULL){
+	restart_needed = decode_radio_commands(chan,chan->commands[i].buffer,
+					       chan->commands[i].length);
+	FREE(chan->commands[i].buffer);
+	chan->commands[i].length = 0;
+	response_needed = true;
+	break;
+      }
+    }
+    pthread_mutex_unlock(&chan->status.lock);
+    response(chan,response_needed);
+    if(restart_needed)
+      break; // restart or terminate
+    useconds_t const s = lrint(1e6 * Blocktime);
+    usleep(s);
+  } while(true);
+  if(Verbose > 1)
+    fprintf(stderr,"%s returning\n",chan->name);
+  return chan->demod_type == INVALID_DEMOD ? -1 : 0;
+}
+// Clean up a terminating demodulator thread
+// Some of this stuff should already be cleaned up, but make sure
+static int close_chan(chan_t *chan){
+  assert(chan != NULL && chan->state != CHANNEL_IDLE);
+  if(chan == NULL || chan->state == CHANNEL_IDLE)
     return -1;
 
-  pthread_t nullthread = {0};
+  pthread_mutex_lock(&Channel_list_mutex);
+  assert(chan->state == CHANNEL_RUNNING);
+  chan->state = CHANNEL_STOPPING;
+  pthread_mutex_unlock(&Channel_list_mutex);
 
+  // Change these to use boolean flags
+  pthread_t nullthread = {0};
   if(chan->rtcp.thread != nullthread){
     pthread_cancel(chan->rtcp.thread);
     pthread_join(chan->rtcp.thread,NULL);
@@ -1093,8 +1031,11 @@ int close_chan(struct channel *chan){
     pthread_cancel(chan->sap.thread);
     pthread_join(chan->sap.thread,NULL);
   }
-
+  pthread_mutex_lock(&Channel_list_mutex);
   pthread_mutex_lock(&chan->status.lock);
+  pthread_mutex_unlock(&Channel_list_mutex);
+
+  // no longer flushed during individual demod exit
   for(int i=0; i < CQLEN; i++){
     FREE(chan->commands[i].buffer);
     chan->commands[i].length = 0;
@@ -1108,15 +1049,15 @@ int close_chan(struct channel *chan){
   FREE(chan->output.queue);
   chan->output.queue_length = 0;
   pthread_mutex_unlock(&chan->status.lock);
+  int err = pthread_mutex_destroy(&chan->status.lock);
+  (void)err;
+  assert(err == 0);
   pthread_mutex_lock(&Channel_list_mutex);
-  if(chan->inuse){
-    // Should be set, but check just in case to avoid messing up Active_channel_count
-    chan->inuse = false;
-    int c = atomic_fetch_sub(&Active_channel_count,1);
-    if(c == 1 && Frontend.shutdown){
-      // No more channels left
-      Frontend.shutdown(&Frontend);
-    }
+  chan->state = CHANNEL_IDLE;
+  int c = Active_channel_count--;
+  if(c == 1 && Frontend.shutdown){
+    // No more channels left
+    Frontend.shutdown(&Frontend);
   }
   pthread_mutex_unlock(&Channel_list_mutex);
   return 0;
@@ -1126,7 +1067,7 @@ int close_chan(struct channel *chan){
 // The new IF is computed here only to determine if the front end needs retuning
 // The second LO frequency is actually set when the new front end frequency is
 // received back from the front end metadata
-double set_freq(struct channel * const chan,double const f){
+double set_freq(chan_t * const chan,double const f){
   assert(chan != NULL);
   if(chan == NULL)
     return NAN;
@@ -1167,9 +1108,9 @@ double set_freq(struct channel * const chan,double const f){
 // Note: single precision floating point is not accurate enough at VHF and above
 // chan->first_LO is NOT updated here!
 // It is set by incoming status frames so this will take time
-double set_first_LO(struct channel const * const chan,double const first_LO){
-  assert(chan != NULL);
-  if(chan == NULL)
+double set_first_LO(chan_t const * const chan,double const first_LO){
+  assert(chan != NULL && !isnan(first_LO) && isfinite(first_LO));
+  if(chan == NULL || isnan(first_LO) || !isfinite(first_LO))
     return NAN;
 
   double const current_lo1 = Frontend.frequency;
@@ -1203,22 +1144,21 @@ double set_first_LO(struct channel const * const chan,double const first_LO){
  an integer quotient and a double remainder, e.g, +/- 20 Hz
 */
 int compute_tuning(int N, int M, double samprate,int *shift,double *remainder, double freq){
+  assert(!isnan(samprate) && !isnan(freq) && N > 0);
   double const hzperbin = samprate / N;
 
-#if 0
-  // Round to multiples of V (not needed anymore)
-  int const V = N / (M-1);
-  int const r = V * lrint((freq/hzperbin) / V);
-#else
+  // It used to be necessary to round the shift to multiples of V, but I worked out how to
+  // step the phase between frames
+  //  int const V = N / (M-1);
+  //  int const r = V * lrint((freq/hzperbin) / V);
   (void)M;
   int const r = lrint(freq/hzperbin);
-#endif
 
   if(shift)
     *shift = r;
 
   if(remainder)
-    *remainder = freq - (r * hzperbin);
+    *remainder = fma(-(double)r, hzperbin, freq);
 
   // Check if there's no overlap in the range we want
   // Intentionally allow real input to go both ways, for front ends with high and low side injection
@@ -1230,8 +1170,9 @@ int compute_tuning(int N, int M, double samprate,int *shift,double *remainder, d
 }
 
 // RTP control protocol sender task
+// this thread is joined during shutdown with the channel lock held, so this cannot hold it
 static void *rtcp_send(void *arg){
-  struct channel *chan = (struct channel *)arg;
+  chan_t *chan = (chan_t *)arg;
   if(chan == NULL)
     pthread_exit(NULL);
 
@@ -1309,7 +1250,7 @@ static void *rtcp_send(void *arg){
    Will probably work better with Opus streams from the opus transcoder, since they're always 48000 Hz stereo; no switching midstream
 */
 static void *sap_send(void *p){
-  struct channel *chan = (struct channel *)p;
+  chan_t *chan = (chan_t *)p;
   assert(chan != NULL);
   if(chan == NULL)
     return NULL;
@@ -1437,7 +1378,7 @@ static void *sap_send(void *p){
 // 10. Run fine tuning, compute average power
 
 // Baseband samples placed in chan->filter.out->output.c
-int downconvert(struct channel *chan){
+int downconvert(chan_t *chan){
   assert(chan != NULL);
   if(chan == NULL)
     return -1;
@@ -1453,9 +1394,9 @@ int downconvert(struct channel *chan){
     // But at least it will eventually go away
     if(chan->lifetime > 0 && --chan->lifetime <= 0){
       // channel timed out
-      chan->demod_type = -1;  // No demodulator
+      chan->demod_type = INVALID_DEMOD;  // No demodulator
       if(Verbose > 1)
-	fprintf(stderr,"%s terminate needed\n",chan->name);
+	fprintf(stderr,"%s timeout\n",chan->name);
       return -1; // terminate needed
     }
     // To save CPU time when the front end is completely tuned away from us, block (with timeout) until the front
@@ -1505,7 +1446,8 @@ int downconvert(struct channel *chan){
 
     // set fine tuning frequency & phase
     // avoid them both being 0 at startup; init chan->filter.remainder as NAN
-    if(shift != chan->filter.bin_shift || remainder != chan->filter.remainder){ // Detect startup
+    // The isnan() test is admittedly redundant since the next comparison will be true
+    if(shift != chan->filter.bin_shift || isnan(chan->filter.remainder) || remainder != chan->filter.remainder){ // Detect startup
       assert(!isnan(chan->tune.doppler_rate) && isfinite(chan->tune.doppler_rate));
       set_osc(&chan->fine,-remainder/chan->output.samprate,chan->tune.doppler_rate/((double)chan->output.samprate * chan->output.samprate));
       chan->filter.remainder = remainder;
@@ -1549,7 +1491,7 @@ int downconvert(struct channel *chan){
   }
   return 0; // Should not actually be reached
 }
-void response(struct channel *chan,bool response_needed){
+void response(chan_t *chan,bool response_needed){
   assert(chan != NULL);
   if(chan == NULL)
     return;
@@ -1583,13 +1525,13 @@ void response(struct channel *chan,bool response_needed){
 
 
 
-int set_channel_filter(struct channel *chan){
+int set_channel_filter(chan_t *chan){
   // Limit to Nyquist rate
   double lower = max(chan->filter.min_IF, -(double)chan->output.samprate/2);
   double upper = min(chan->filter.max_IF, (double)chan->output.samprate/2);
 
   if(Verbose > 1)
-    fprintf(stderr,"chan %s new filter: IF=[%'.0f,%'.0f], samprate %'d, kaiser beta %.1f\n",
+    fprintf(stderr,"%s new filter: IF=[%'.0f,%'.0f], samprate %'d, kaiser beta %.1f\n",
 	    chan->name, lower, upper,
 	    chan->output.samprate, chan->filter.kaiser_beta);
 
@@ -1609,7 +1551,7 @@ int set_channel_filter(struct channel *chan){
     // Secondary filter running at 1:1 sample rate with order = filter2.blocking * inblock
     create_filter_input(&chan->filter2.in,blocksize,order+1,COMPLEX);
     chan->filter2.in.perform_inline = true;
-    create_filter_output(&chan->filter2.out,&chan->filter2.in,NULL,blocksize, COMPLEX);
+    create_filter_output(&chan->filter2.out,&chan->filter2.in,blocksize, COMPLEX);
     chan->filter2.out.isb = old_isb;
     chan->filter2.low = lower;
     chan->filter2.high = upper;
@@ -1807,7 +1749,7 @@ static double quantile(double *array, int n, double p) {
 // However, the distribution is skewed, so you have to compensate for this when computing means from partial averages
 // ChatGPT helped me work out the math; its reasoning is summarized in docs/noise.md
 // I'm using its method 3 (average of bins below a threshold)
-static double estimate_noise(struct channel *chan,int shift){
+static double estimate_noise(chan_t *chan,int shift){
   assert(chan != NULL);
   if(chan == NULL)
     return NAN;

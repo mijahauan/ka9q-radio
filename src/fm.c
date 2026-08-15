@@ -1,6 +1,5 @@
 // FM demodulation and squelch for ka9q-radio
 // Copyright 2018-2025, Phil Karn, KA9Q
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <pthread.h>
 #include <string.h>
@@ -17,7 +16,7 @@
 
 // FM demodulator thread
 int demod_fm(void *arg){
-  struct channel * const chan = arg;
+  chan_t * const chan = arg;
   assert(chan != NULL);
   if(chan == NULL)
     return -1;
@@ -25,15 +24,14 @@ int demod_fm(void *arg){
   assert(Blocktime != 0);
   assert(chan->frontend != NULL);
 
-  pthread_mutex_init(&chan->status.lock,NULL);
   pthread_mutex_lock(&chan->status.lock);
   int const samprate = chan->output.samprate; // Doesn't change, keep local copy
   int const blocksize = lrint(samprate * Blocktime);
 
-  int const status = create_filter_output(&chan->filter.out,&chan->frontend->in,NULL,blocksize, COMPLEX);
+  int const status = create_filter_output(&chan->filter.out,&chan->frontend->in,blocksize, COMPLEX);
   if(status != 0){
     pthread_mutex_unlock(&chan->status.lock);
-    return -1;
+    goto quit;
   }
   chan->filter.out.beam = chan->filter.beam;
   if(chan->filter.out.beam)
@@ -49,9 +47,9 @@ int demod_fm(void *arg){
 
   double complex phase_memory = 0;
   chan->output.channels = 1; // Only mono for now
-  if(isnan(chan->squelch.open) || chan->squelch.open == 0)
+  if(!isfinite(chan->squelch.open) || chan->squelch.open == 0)
     chan->squelch.open = 6.3;  // open above ~ +8 dB
-  if(isnan(chan->squelch.close) || chan->squelch.close == 0)
+  if(!isfinite(chan->squelch.close) || chan->squelch.close == 0)
     chan->squelch.close = 4; // close below ~ +6 dB
 
   chan->fm.devmax = 5000.; // nominal peak deviation Hz
@@ -94,11 +92,9 @@ int demod_fm(void *arg){
       }
     }
     pthread_mutex_unlock(&chan->status.lock);
-    if(restart_needed)
+    int r;
+    if(restart_needed || (r = downconvert(chan)) == -1)
       break; // restart or terminate
-    int r = downconvert(chan);
-    if(r == -1)
-      break; // restart needed
     else if(r == 1)
       continue; // channel inactive; poll for commands
 
@@ -352,21 +348,19 @@ int demod_fm(void *arg){
       break; // no valid output stream; terminate!
 
   } while(true);
+  response(chan,response_needed); // in case one is pending as we're restarting
+ quit:;
   if(Verbose > 1)
-    fprintf(stderr,"%s exiting\n",chan->name);
+    fprintf(stderr,"%s returning\n",chan->name);
 
   // clean up
   FREE(chan->output.queue);
   chan->output.queue_length = 0;
-  for(int i=0; i < CQLEN; i++){
-    FREE(chan->commands[i].buffer);
-    chan->commands[i].length = 0;
-  }
   if(chan->opus.encoder != NULL){
     opus_encoder_destroy(chan->opus.encoder);
     chan->opus.encoder = NULL;
   }
   delete_filter_output(&chan->filter.out);
   chan->baseband = NULL;
-  return 0; // Normal exit
+  return chan->demod_type == INVALID_DEMOD ? -1 : 0;
 }

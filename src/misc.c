@@ -1,10 +1,6 @@
 // Miscellaneous low-level routines for ka9q-radio
 // Copyright 2018, Phil Karn, KA9Q
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE 1
-#endif
-
 #include <math.h>
 #include <assert.h>
 #include <stdio.h>
@@ -212,9 +208,9 @@ void stick_core(void){
       // thread_siblings_list may be comma-separated ("0,1") or a range
       // ("0-1"); parse both so SMT siblings aren't dropped (strtol stops at '-').
       char *string = corelist;
-      char *ptr = NULL;
+      char const *ptr = NULL;
       while((ptr = strsep(&string,",")) != NULL){
-	char *dash = strchr(ptr,'-');
+	char const *dash = strchr(ptr,'-');
 	int lo = (int)strtol(ptr,NULL,0);
 	int hi = dash ? (int)strtol(dash+1,NULL,0) : lo;
 	for(int c = lo; c <= hi && c < CPU_SETSIZE; c++){
@@ -732,57 +728,84 @@ char *ftime(char * result,int size,int64_t t){
 // 12g345 (12.345 GHz)
 // If no g/m/k and number is too small, make a heuristic guess
 // NB! This assumes radio covers 100 kHz - 2 GHz; should make more general
-double parse_frequency(char const *s,bool heuristics){
-  char * const ss = alloca(strlen(s)+1);
+rational_64 parse_frequency_rational(char const *s,bool heuristics){
+  // Make lower case copy of input string
+  unsigned char * const ss = alloca(strlen(s)+1);
   {
-    size_t i;
-    for(i=0;i<strlen(s);i++)
-      ss[i] = (char)tolower(s[i]);
+    size_t i,len;
+    len = strlen(s);
+    for(i=0; i<len; i++)
+      ss[i] = (unsigned char)tolower((unsigned char)s[i]);
 
     ss[i] = '\0';
   }
-  // Don't hardwire the decimal point, use the current locale
-  char decimal = '.';
-  struct lconv *lc = localeconv();
-  if(lc != NULL && lc->decimal_point != NULL && strlen(lc->decimal_point) > 0)
-    decimal = lc->decimal_point[0];
-
-  double mult = 1;
-  // k, m or g in place of decimal point indicates scaling by 1k, 1M or 1G
-  // h (hertz) means unity scaling; it can be used as a locale-independent
-  // decimal point
-  char *sp = NULL;
-  if((sp = strchr(ss,'g')) != NULL){
-    mult = 1e9;
-    *sp = decimal;
-  } else if((sp = strchr(ss,'m')) != NULL){
-    mult = 1e6;
-    *sp = decimal;
-  } else if((sp = strchr(ss,'k')) != NULL){
-    mult = 1e3;
-    *sp = decimal;
-  } else if((sp = strchr(ss,'h')) != NULL){
-    mult = 1;
-    *sp = decimal;
-  } else if((sp = strchr(ss,decimal)) != NULL){
-    // Disable heuristic if explicitly given
+  bool radix_seen = false;
+  bool sign = false;
+  int mult = 0;
+  uint64_t num = 0;
+  uint64_t den = 1;
+  uint64_t const cutoff = UINT64_MAX / 10; // largest before overflow when multiplying by 10
+  for(unsigned char const *cp = ss; *cp != '\0'; cp++){
+    unsigned char c = *cp;
+    if(c == '-'){
+      sign = true;
+    } else if(isdigit(c)){
+      unsigned const d = c - '0';
+      if(num < cutoff || (num == cutoff && d <= UINT64_MAX % 10)){
+	num = num * 10 + d;
+	if(radix_seen)
+	  mult--;
+      } else
+	goto fail;
+    } else if(c == 'g'){
+      mult += 9;
+      radix_seen = true;
+    } else if(c == 'm'){
+      mult += 6;
+      radix_seen = true;
+    } else if(c == 'k'){
+      mult += 3;
+      radix_seen = true;
+    } else if(c == '.' || c == ','){
+      radix_seen = true;
+    }
+    // unknown chars are ignored
   }
-  char *endptr = NULL;
-  double f = strtod(ss,&endptr);
-  if(endptr == ss || f == 0)
-    return 0; // Empty entry, or nothing decipherable
-
-  if(!heuristics || sp != NULL || f >= 1e5) // If multiplier explicitly given, or frequency >= 100 kHz (lower limit), return as-is
-    return f * mult;
-
-  // no radix specified & heuristics enabled: empirically guess kHz or MHz
-  if(f < 500)         // Could be kHz or MHz, arbitrarily assume MHz
-    return f * 1e6;
-  else if(f < 100000)
-    return f * 1e3;         // assume kHz
-  else return f;
+  if(radix_seen){
+    for(int i=0; i < mult; i++){
+      if(num > cutoff)
+	goto fail;
+      num *= 10;
+    }
+    for(int i = 0; i > mult; i--){
+      if(den > cutoff)
+	goto fail;
+      den *= 10;
+    }
+  } else if(heuristics){
+    if(num < 500)
+      num *= 1000000; // assume megahertz, won't overflow
+    else if(num < 100000)
+      num *= 1000;    // assume kilohertz, won't overflow
+  }
+  // Form result
+  if(num > INT64_MAX)
+    goto fail; // must allow room for sign bit
+  rational_64 result = {.num = (int64_t)num, .den = den};
+  result = rational_reduce_64(result);
+  if(sign)
+    result.num = -result.num;
+  return result;
+ fail:;
+  {
+    rational_64 result = {0}; // zero denom is invalid
+    return result;
+  }
 }
-
+double parse_frequency(char const *s, bool heuristics){
+  rational_64 r = parse_frequency_rational(s,heuristics);
+  return (double)r.num / (double)r.den;
+}
 // Return smallest integer greater than N with no factors > 7
 // Useful for determining efficient FFT sizes
 uint32_t nextfastfft(uint32_t n){
@@ -992,22 +1015,6 @@ size_t round_to_hugepage(size_t size){
     pages++;
   return pages * hugepagesize;
 }
-// Custom version of malloc that aligns to a cache line
-// This is 64 bytes on most modern machines, including the x86 and the ARM 2711 (Pi 4)
-// This is stricter than a float complex or double complex, which is required by fftwf/fftw
-void *lmalloc(size_t size){
-  void *ptr;
-  int r;
-  if((r = posix_memalign(&ptr,64,size)) == 0){
-    assert(ptr != NULL);
-    return ptr;
-  }
-  errno = r;
-  assert(false);
-  return NULL;
-}
-
-
 // Special version of malloc that allocates a mirrored block
 // The block first appears normally, then is followed by a duplicate mapping
 // Very useful for circular buffers that must be accessed sequentially, without wraparound
@@ -1105,8 +1112,9 @@ void *mirror_alloc(size_t size){
   uint8_t *mirror = mmap(base + size,size, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_SHARED, fd, 0);
   if(mirror != base + size){
     perror("mirror_alloc 3rd mmap");
+    close(fd);
     munmap(base,size * 2);
-    base = NULL;
+    return NULL;
   }
   close(fd); // No longer needed after all memory maps are in place
   return base;
@@ -1129,7 +1137,6 @@ void *mirror_alloc(size_t size){
     close(fd);
     return NULL;
   }
-
   // Reserve virtual space for buffer + mirror
   uint8_t *base = mmap(NULL,size * 2, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); // Retry normal
   if(base == MAP_FAILED){
@@ -1149,7 +1156,8 @@ void *mirror_alloc(size_t size){
   if(mirror != base + size){
     perror("mirror_alloc second mmap");
     munmap(base,size * 2);
-    base = NULL;
+    close(fd);
+    return NULL;
   }
   close(fd); // No longer needed after all memory maps are in place
   return base;

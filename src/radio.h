@@ -16,6 +16,7 @@
 #include <iniparser/iniparser.h>
 #include <dlfcn.h>
 #include <opus/opus.h>
+#include <stdatomic.h>
 
 #include "config.h"
 #include "multicast.h"
@@ -32,11 +33,13 @@
    @brief The four demodulator types
  */
 enum demod_type {
+  INVALID_DEMOD = -1,   // used as sentinel
   LINEAR_DEMOD = 0,     // Linear demodulation, i.e., everything else: SSB, CW, DSB, CAM, IQ
   FM_DEMOD,             // Frequency/phase demodulation
   WFM_DEMOD,            // wideband frequency modulation (broadcast stereo)
   SPECT_DEMOD,          // Spectrum analysis pseudo-demod
   SPECT2_DEMOD,         // spectrum v2: 8-bit log bins, low-to-high order
+  IDLE_DEMOD,           // placeholder that just processes commands
   N_DEMOD,              // Dummy equal to number of valid entries
 };
 
@@ -115,11 +118,9 @@ struct frontend {
   pthread_mutex_t status_mutex;
   pthread_cond_t status_cond;     // Signalled whenever status changes
 
-
-
   // Entry points for local front end driver
   void *context;         // Stash hardware-dependent control block
-  int (*setup)(struct frontend *,dictionary *,char const *); // Get front end ready to go
+  int (*setup)(struct frontend *,dictionary const *,char const *); // Get front end ready to go
   int (*start)(struct frontend *);          // Start front end sampling
   int (*shutdown)(struct frontend *);           // Stop front end, used when there are no channels. Optional for now.
   double (*tune)(struct frontend *,double); // Tune front end, return actual frequency
@@ -141,8 +142,15 @@ Be careful with memcpy(): there are a few pointers (spectrum.bin_data, status.co
 If you use these in shadow copies you must malloc these arrays yourself.
 */
 struct channel {
-  bool inuse;
+  _Atomic enum {
+    CHANNEL_IDLE = 0,
+    CHANNEL_STARTING,
+    CHANNEL_RUNNING,
+    CHANNEL_STOPPING
+  } state;
   char name[100];
+  bool advertise;         // Enable avahi advertising of services
+  bool use_dns;
   struct frontend *frontend; // Linkage to avoid global use
 
   int lifestart;         // Initial lifetime, frames
@@ -338,9 +346,12 @@ struct channel {
   uint64_t options;
   double tp1,tp2; // Spare test points that can be read on the status channel
 };
+typedef struct channel chan_t;
 
 
-extern struct channel Channel_list[];
+extern struct frontend Frontend;
+extern chan_t Channel_list[];
+extern chan_t Template;
 #define Nchannels 2000
 extern int Channel_idle_timeout;
 extern int Ctl_fd;     // File descriptor for receiving user commands
@@ -352,24 +363,25 @@ extern char const *Channel_keys[]; // Lists of valid keywords in config files
 extern double User_blocktime;
 extern double Blocktime;
 extern struct string_table opus_application[];
+extern pthread_mutex_t Channel_list_mutex;
+extern dictionary const *Preset_table;   // Table of presets, usually in /usr/local/share/ka9q-radio/presets.conf, never closed so can be const
+
 
 // Channel configuration, initialization & manipulation
 int loadconfig(char const *file);
-struct channel *create_chan(uint32_t ssrc);
-struct channel *lookup_chan(uint32_t ssrc);
-int close_chan(struct channel *);
-int set_defaults(struct channel *chan);
-int loadpreset(struct channel *chan,dictionary const *table,char const *preset);
-int start_demod(struct channel * restrict chan);
-double set_freq(struct channel * restrict ,double);
-double set_first_LO(struct channel const * restrict, double);
-void encode_byte_data(struct channel const *chan,uint8_t *buffer);
+chan_t *lookup_or_create_chan(uint32_t ssrc,chan_t const *chan);
+int set_defaults(chan_t *chan);
+int loadpreset(chan_t *chan,dictionary const *table,char const *preset);
+int start_demod(chan_t * restrict chan);
+double set_freq(chan_t * restrict ,double);
+double set_first_LO(chan_t const * restrict, double);
+void encode_byte_data(chan_t const *chan,uint8_t *buffer);
 
 // Routines common to the internals of all channel demods
 int compute_tuning(int N, int M, double samprate,int *shift,double *remainder, double freq);
-int downconvert(struct channel *chan);
-int set_channel_filter(struct channel *chan);
-void response(struct channel *chan,bool response_needed);
+int downconvert(chan_t *chan);
+int set_channel_filter(chan_t *chan);
+void response(chan_t *chan,bool response_needed);
 
 // extract front end scaling factors (depends on width of A/D sample)
 double scale_voltage_out2FS(struct frontend *frontend);
@@ -379,18 +391,19 @@ double scale_ADpower2FS(struct frontend const *frontend);
 void *radio_status(void *);
 
 // Demodulator thread entry points
+int demod_idle(void *);
 int demod_fm(void *);
 int demod_wfm(void *);
 int demod_linear(void *);
 int demod_spectrum(void *);
 
 // Control and status
-int send_output(struct channel * restrict ,const float * ,int,bool);
-int send_radio_status(struct sockaddr const *,struct frontend const *, struct channel *);
-int reset_radio_status(struct channel *chan);
-bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,int length);
-int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_t const *buffer,int length);
-int flush_output(struct channel *chan,bool marker,bool complete);
+int send_output(chan_t * restrict ,const float * ,int,bool);
+int send_radio_status(struct sockaddr const *,struct frontend const *, chan_t *);
+int reset_radio_status(chan_t *chan);
+bool decode_radio_commands(chan_t *chan,uint8_t const *buffer,int length);
+int decode_radio_status(struct frontend *frontend,chan_t *channel,uint8_t const *buffer,int length);
+int flush_output(chan_t *chan,bool marker,bool complete);
 
 
 unsigned int round_samprate(unsigned int x);
