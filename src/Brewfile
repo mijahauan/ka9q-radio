@@ -1,8 +1,8 @@
 # Homebrew dependencies for building ka9q-radio on macOS
 # Usage: brew bundle --file=src/Brewfile
 #
-# Note: the Makefile prefers MacPorts (/opt/local) if it is installed;
-# force Homebrew with: make MACPREFIX="$(brew --prefix)"
+# Note: the Makefile uses Homebrew if it is installed, falling back to
+# MacPorts (/opt/local). Force a particular prefix with: make MACPREFIX=...
 # See docs/INSTALL-macos.md for details.
 
 brew "pkg-config"

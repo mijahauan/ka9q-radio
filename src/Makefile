@@ -53,8 +53,8 @@ ifdef SANITIZE
 endif
 
 ifeq ($(UNAME_S),Darwin)
-  # Package prefix: MacPorts if installed, otherwise Homebrew. Override with MACPREFIX=
-  MACPREFIX ?= $(if $(wildcard /opt/local/include),/opt/local,$(shell brew --prefix 2>/dev/null))
+  # Package prefix: Homebrew if installed, otherwise MacPorts. Override with MACPREFIX=
+  MACPREFIX ?= $(or $(shell brew --prefix 2>/dev/null),/opt/local)
   INCLUDES += -I$(MACPREFIX)/include
   LDFLAGS  += -L$(MACPREFIX)/lib
   # gettext and ncurses are keg-only in Homebrew; add their paths if present

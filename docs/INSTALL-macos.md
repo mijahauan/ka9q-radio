@@ -11,7 +11,13 @@ Differences from Linux to be aware of:
 
 ## Prerequisites
 
-Install either MacPorts or Homebrew. If both are installed, the build prefers MacPorts; override with `make MACPREFIX=...`.
+Install either Homebrew or MacPorts. If both are installed, the build uses Homebrew; override with `make MACPREFIX=...`.
+
+Homebrew:
+
+```
+brew bundle --file=src/Brewfile
+```
 
 MacPorts:
 
@@ -20,13 +26,7 @@ sudo port install fftw-3-single iniparser libogg libopus libsamplerate libusb nc
 sudo port install airspy airspyhf hackrf rtl-sdr    # optional, per your hardware
 ```
 
-Homebrew:
-
-```
-brew bundle --file=src/Brewfile
-```
-
-Driver plugins for SDR front ends are enabled automatically at build time if the corresponding library headers are installed; `rx888.so`, `sig_gen.so`, and `funcube.so` need only the core libraries. Check the build output to see which drivers were built, or force one on/off with e.g. `make ENABLE_AIRSPY=1`.
+Driver plugins for SDR front ends are enabled automatically at build time if the corresponding library headers are installed; `rx888.so`, `sig_gen.so`, and `funcube.so` need only the core libraries. Check the build output to see which drivers were built, or force one on/off with e.g. `make ENABLE_AIRSPY=1`. Note that the probe only looks under the prefix actually in use, so vendor libraries installed under the *other* package manager are invisible -- if a driver you expected is missing, check that its headers are under `$(MACPREFIX)/include`.
 
 ## Compiling and Installing
 
