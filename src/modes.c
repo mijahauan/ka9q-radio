@@ -491,8 +491,9 @@ int loadpreset(chan_t *chan,dictionary const *table,char const *sname){
   }
   {
     char const *data = config_getstring(table,sname,"data",chan->output.dest_string);
-    // When the key is absent config_getstring() hands back the default, i.e. this very buffer.
-    // Copying it onto itself is an overlapping copy that traps under macOS's fortified strlcpy.
+    // config_getstring() hands back the default when the key is absent, i.e. this very
+    // buffer. strlcpy() is undefined on overlapping objects; macOS's fortified version
+    // traps on it, killing radiod before the first channel starts.
     if(data != chan->output.dest_string)
       strlcpy(chan->output.dest_string,data,sizeof chan->output.dest_string);
   }
