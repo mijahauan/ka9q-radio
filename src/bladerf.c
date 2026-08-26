@@ -3,9 +3,9 @@
 #include <pthread.h>
 #include <libbladeRF.h>
 #include <errno.h>
+#include <iniparser/iniparser.h>
 #include <string.h>
 #include <strings.h>
-#include <iniparser/iniparser.h>
 #if defined(linux)
 #include <bsd/string.h>
 #endif
