@@ -9,13 +9,13 @@
  * @endverbatim
 **/
 
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <pthread.h>
 #include <rtl-sdr.h>
 #include <errno.h>
 #include <iniparser/iniparser.h>
 #include <sysexits.h>
+#include <string.h>
 #include <strings.h>
 #include <stdatomic.h>
 #include <unistd.h>
@@ -23,6 +23,8 @@
 #include "misc.h"
 #include "radio.h"
 #include "config.h"
+#include "sched.h"
+#include "defaults.h"
 
 // Define USE_NEW_LIBRTLSDR to use my version of librtlsdr with rtlsdr_get_freq()
 // that corrects for synthesizer fractional-N residuals. If not defined, we do the correction
@@ -105,7 +107,7 @@ static void rx_callback(uint8_t *buf,uint32_t len, void *ctx);
 static double true_freq(uint64_t freq);
 
 
-int rtlsdr_setup(struct frontend *frontend,dictionary *dictionary,char const *section){
+int rtlsdr_setup(struct frontend *frontend,dictionary const * const dictionary,char const *section){
   assert(dictionary != NULL);
 
   struct sdr * const sdr = (struct sdr *)calloc(1,sizeof(struct sdr));
@@ -261,7 +263,6 @@ static void *rtlsdr_read_thread(void *arg){
   struct sdr * const sdr = arg;
   struct frontend * const frontend = sdr->frontend;
 
-  realtime(2 + default_prio());
   stick_core();
   rtlsdr_reset_buffer(sdr->device);
   int r = rtlsdr_read_async(sdr->device,rx_callback,frontend,0,16*16384); // blocks
@@ -337,7 +338,7 @@ static void rx_callback(uint8_t * const buf, uint32_t len, void * const ctx){
     wptr[i] = (float complex)(sdr->scale * samp);
   }
   write_cfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT
-  if(sampcount != 0 && !isnan(energy) && isfinite(energy))
+  if(sampcount != 0 && isfinite(energy))
     frontend->if_power += Power_smooth * (energy / sampcount - frontend->if_power);
   frontend->samples += sampcount;
 }

@@ -1,6 +1,5 @@
 // ka9q-radio driver for Great Scott Gadgets Hack RF
 // Need to figure out how to detect a device failure during streaming
-#define _GNU_SOURCE 1 // allow bind/connect/recvfrom without casting sockaddr_in6
 #include <assert.h>
 #include <pthread.h>
 #include <string.h>
@@ -25,6 +24,8 @@
 #include "radio.h"
 #include "misc.h"
 #include "config.h"
+#include "sched.h"
+#include "defaults.h"
 
 // Configurable parameters
 // decibel limits for power
@@ -302,7 +303,6 @@ static int rx_callback(hackrf_transfer *transfer){
   if(!Name_set){
     pthread_setname("hackrf-cb");
     Name_set = true;
-    realtime(2 + default_prio());
     stick_core();
   }
   int remain = transfer->valid_length; // Count of individual samples; divide by 2 to get complex samples

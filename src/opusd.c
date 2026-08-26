@@ -10,7 +10,6 @@
 // Makes better use of multicore CPUs under heavy load (like encoding the entire 2m band at once)
 // Copyright Jan 2018-2023 Phil Karn, KA9Q
 
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <math.h>
@@ -42,6 +41,8 @@
 #include "status.h"
 #include "iir.h"
 #include "avahi.h"
+#include "sched.h"
+#include "defaults.h"
 
 #define BUFFERSIZE 16384  // Big enough for 120 ms @ 48 kHz stereo (11,520 16-bit samples)
 
@@ -262,12 +263,11 @@ int main(int argc,char * const argv[]){
   // Graceful signal catch
   signal(SIGPIPE,closedown);
   signal(SIGINT,closedown);
-  signal(SIGKILL,closedown);
   signal(SIGQUIT,closedown);
   signal(SIGTERM,closedown);
   signal(SIGPIPE,SIG_IGN);
 
-  realtime(default_prio());
+  realtime(DEFAULT_PRIO);
 
   // Loop forever processing and dispatching incoming PCM and status packets
 

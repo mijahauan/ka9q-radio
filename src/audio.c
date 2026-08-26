@@ -2,7 +2,6 @@
 // Handles linear 16-bit PCM, mono and stereo
 // Copyright 2017-2024 Phil Karn, KA9Q
 
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -28,20 +27,20 @@
 #define BYTES_PER_PKT 1440 // 3 frames of 16-bit LPCM @ 12 kHz, a common value
 
 bool GetSockOptFailed = false;     // Have we issued this log message yet?
-bool TempSendFailure = false;
+static atomic_flag TempSendFailure = ATOMIC_FLAG_INIT;
 
 int Fec_percent = 0;               // Use forward error correction percentage, 0-100
 
 static atomic_flag Opus_version_logged = ATOMIC_FLAG_INIT;
 
 static inline void sanity_check(float const *buf, int count);
-static int setup_opus(struct channel *chan);
-static int max_frames(struct channel *chan);
+static int setup_opus(chan_t *chan);
+static int max_frames(chan_t *chan);
 
 // Send PCM output on stream; # of channels implicit in chan->output.channels
-int send_output(struct channel * restrict const chan, float const * restrict buffer, int frames, bool const mute){
+int send_output(chan_t * restrict const chan, float const * restrict buffer, int frames, bool const mute){
   assert(chan != NULL);
-  if(frames <= 0 || chan->output.channels == 0 || chan->output.samprate == 0)
+  if(chan == NULL || frames <= 0 || chan->output.channels == 0 || chan->output.samprate == 0)
     return 0;
 
   if(mute || buffer == NULL){
@@ -89,8 +88,14 @@ int send_output(struct channel * restrict const chan, float const * restrict buf
 	  copylen = frames; // limit to what we have
 	assert(chan->output.queue != NULL);
 	sanity_check(chan->output.queue, chan->output.queue_length * chan->output.channels);
-	chan->output.queue = realloc(chan->output.queue, (chan->output.queue_length + copylen) * chan->output.channels * sizeof(float));
+	{
+	  // Use a temp so a realloc failure doesn't leak the old queue.
+	  float *tmp = realloc(chan->output.queue, (chan->output.queue_length + copylen) * chan->output.channels * sizeof(float));
+	  chan->output.queue = tmp;
+	}
 	assert(chan->output.queue != NULL);
+	if(chan->output.queue == NULL)
+	  return frames_sent; // Not sure recovery is really possible
 	sanity_check(chan->output.queue, chan->output.queue_length * chan->output.channels);
 	memcpy(chan->output.queue + chan->output.channels * chan->output.queue_length,
 	       buffer, copylen * chan->output.channels * sizeof(float));
@@ -204,14 +209,15 @@ int send_output(struct channel * restrict const chan, float const * restrict buf
       if(r < 0){
 	chan->output.errors++;
 	if(errno == EAGAIN){
-	  if(!TempSendFailure){
-	    fprintf(stderr,"Temporary send failure, suggest increased buffering (see sysctl net.core.wmem_max, net.core.wmem_default\n");
+	  if(!atomic_flag_test_and_set_explicit(&TempSendFailure,memory_order_relaxed)){
+	    fprintf(stderr,"%s Temporary send failure, suggest increased buffering (see sysctl net.core.wmem_max, net.core.wmem_default\n",
+		    chan->name);
 	    fprintf(stderr,"Additional messages suppressed\n");
-	    TempSendFailure = true;
 	  }
 	} else {
-	  fprintf(stderr,"audio send failure: %s\n",strerror(errno));
-	  abort(); // Probably more serious, like the loss of an interface or route; restart from systemd
+	  if(!atomic_flag_test_and_set_explicit(&TempSendFailure,memory_order_relaxed)){
+	    fprintf(stderr,"%s audio send failure: %s (any additional messages suppressed)\n",chan->name,strerror(errno));
+	  }
 	}
       }
       if(chan->output.pacing && available_frames > 0)
@@ -236,7 +242,7 @@ int send_output(struct channel * restrict const chan, float const * restrict buf
   return frames_sent;
 }
 
-static int setup_opus(struct channel *chan){
+static int setup_opus(chan_t *chan){
   if(chan->opus.encoder != NULL){
     // There doesn't seem to be any way to read back the channel count, so we save that explicitly
     // If the sample rate changes we'll get restarted anyway, so this test isn't really needed. But do it anyway.
@@ -362,7 +368,7 @@ static int setup_opus(struct channel *chan){
   }
   return 0;
 }
-static int max_frames(struct channel *chan){
+static int max_frames(chan_t *chan){
   // The PCM modes are limited by the Ethenet MTU
   // Opus is essentially unlimited as it should never fill an ethernet (?)
   int max_frames_per_pkt = 0;

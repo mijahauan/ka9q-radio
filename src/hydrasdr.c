@@ -2,12 +2,13 @@
 // Copyright 2023, Phil Karn, KA9Q
 
 #undef DEBUG_AGC
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <libhydrasdr/hydrasdr.h>
 #include <errno.h>
 #include <iniparser/iniparser.h>
+#include <string.h>
 #if defined(linux)
 #include <bsd/string.h>
 #endif
@@ -21,6 +22,12 @@
 #include "status.h"
 #include "radio.h"
 #include "config.h"
+#include "airspy.h"
+#include "sched.h"
+#include "defaults.h"
+
+// Non-temporal (cache-bypassing) stores don't seem to help with the Airspy/Hydra because the FFTs are smaller
+#define CACHED_STORE 1
 
 // Global variables set by config file options
 extern int Verbose;
@@ -106,7 +113,7 @@ static char const *Hydrasdr_keys[] = {
 NULL
 };
 
-
+static bool Name_set = false;
 static double Power_alpha = 0.05; // Calculate this properly someday
 static double set_correct_freq(struct sdrstate *sdr,double freq);
 static int rx_callback(hydrasdr_transfer *transfer);
@@ -114,7 +121,7 @@ static void *hydrasdr_monitor(void *p);
 static double true_freq(uint64_t freq);
 static void set_gain(struct sdrstate *sdr,int gainstep);
 
-int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionary,char const * const section){
+int hydrasdr_setup(struct frontend * const frontend,dictionary const * const Dictionary,char const * const section){
   assert(Dictionary != NULL);
 
   struct sdrstate * const sdr = calloc(1,sizeof(struct sdrstate));
@@ -146,17 +153,29 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
     }
   }
   {
-    char const * const sn = config_getstring(Dictionary,section,"serial",NULL);
-    if(sn != NULL){
+    sdr->SN = 0;
+    extern char const *Serial; // Defined in main.c, set from -s on command line
+    char const *sn = NULL;
+    if(Serial != NULL && strlen(Serial) > 0){
+      fprintf(stderr,"Serial '%s' specified on command line\n",Serial);
+      sn = Serial;
+      char const *colon = strchr(sn,':');
+      if(colon != NULL)
+	sn = colon+1;
       char *endptr = NULL;
-      sdr->SN = 0;
       sdr->SN = strtoull(sn,&endptr,16);
-      if(endptr == NULL || *endptr != '\0'){
+      if(endptr == NULL || *endptr != '\0')
 	fprintf(stderr,"Invalid serial number %s in section %s\n",sn,section);
-	return -1;
-      }
-    } else {
-      // Serial number not specified, enumerate and pick one
+    }
+    // If not successfully set from command line, use keyword in config file, if any
+    if(sdr->SN == 0 && (sn = config_getstring(Dictionary,section,"serial",NULL)) != NULL){
+      char *endptr = NULL;
+      sdr->SN = strtoull(sn,&endptr,16);
+      if(endptr == NULL || *endptr != '\0')
+	fprintf(stderr,"Invalid serial number %s in section %s\n",sn,section);
+    }
+    // If it still hasn't been set, enumerate and pick one
+    if(sdr->SN == 0){
       int n_serials = 100; // ridiculously large
       uint64_t serials[n_serials];
 
@@ -166,21 +185,25 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
 	return -1;
       }
       if(n_serials > 1){
+	flockfile(stderr);
 	fprintf(stderr,"Discovered %d HydraSDR device serial%s:",n_serials,n_serials > 1 ? "s" : "");
 	for(int i = 0; i < n_serials; i++){
 	  fprintf(stderr," %llx",(long long)serials[i]);
 	}
 	fprintf(stderr,"\n");
+	funlockfile(stderr);
       }
       sdr->SN = serials[0];
     }
   }
   {
+    flockfile(stderr);
     fprintf(stderr,"Selecting HydraSDR SN %llx:",(long long)sdr->SN);
 
     int const ret = hydrasdr_open_sn(&sdr->device,sdr->SN);
     if(ret != HYDRASDR_SUCCESS){
       fprintf(stderr," hydrasdr_open failed: %s\n", hydrasdr_error_name(ret));
+      funlockfile(stderr);
       return -1;
     }
   }
@@ -189,6 +212,7 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
     int ret = hydrasdr_get_device_info(sdr->device, &info);
     if(ret != HYDRASDR_SUCCESS){
       fprintf(stderr, " cannot get HydraSDR information: %s\n", hydrasdr_error_name(ret));
+      funlockfile(stderr);
       return -1;
     }
     fprintf(stderr," hw '%s'; firmware '%s'; features:", info.board_name, info.firmware_version);
@@ -202,7 +226,6 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
     if (info.features & HYDRASDR_CAP_PACKING)
       fprintf(stderr," sample_packing");
     fputc('\n',stderr);
-
     fprintf(stderr,"Supported sample types:");
     for (unsigned int i = 0; i < HYDRASDR_SAMPTYPES; i++) {
       if(info.sample_types & (1 << i)) {
@@ -269,10 +292,12 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
       frontend->bitspersample = 8;
     } else {
       fprintf(stderr,"; no supported sample formats\n");
+      funlockfile(stderr);
       return -1;
     }
     fprintf(stderr,"; choosing %s, A/D width %d bits\n",
 	    Sample_type_name[sdr->sample_type], frontend->bitspersample);
+    funlockfile(stderr);
 
     // Set this now, as it affects the list of supported sample rates
     ret = hydrasdr_set_sample_type(sdr->device,sdr->sample_type);
@@ -285,6 +310,7 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
      fprintf(stderr,"No valid HydraSDR sample rates!\n");
       return -1;
     }
+    flockfile(stderr);
     fprintf(stderr,"HydraSDR has %'d sample rate%s:",number_sample_rates,number_sample_rates > 1 ? "s":"");
     ret = hydrasdr_get_samplerates(sdr->device,sdr->sample_rates,number_sample_rates);
     assert(ret == HYDRASDR_SUCCESS);
@@ -321,6 +347,7 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
     break;
   }
   fprintf(stderr,"; choosing %'.3lf Hz, offset %'.3lf Hz\n",frontend->samprate,sdr->offset);
+  funlockfile(stderr);
   {
     int ret __attribute__ ((unused));
     ret = hydrasdr_set_samplerate(sdr->device,(uint32_t)frontend->samprate);
@@ -329,6 +356,7 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
   // Gain features
   sdr->linearity = config_getboolean(Dictionary,section,"linearity",false);
 
+  flockfile(stderr);
   fprintf(stderr,"Gain features:");
   if (info.features & HYDRASDR_CAP_LINEARITY_GAIN) {
     fprintf(stderr," linearity %u-%u (%u)",
@@ -385,6 +413,7 @@ int hydrasdr_setup(struct frontend * const frontend,dictionary * const Dictionar
 	    info.vga_gain.default_value);
   }
   fputc('\n',stderr);
+  funlockfile(stderr);
 
   sdr->converter = config_getdouble(Dictionary,section,"converter",0);
   frontend->calibrate = config_getdouble(Dictionary,section,"calibrate",0);
@@ -569,7 +598,6 @@ static void *hydrasdr_monitor(void *p){
   struct sdrstate * const sdr = (struct sdrstate *)p;
   assert(sdr != NULL);
   pthread_setname("hydrasdr-mon");
-  realtime(2 + default_prio()); // Doesn't seem to work
   stick_core();
 
   int ret = hydrasdr_start_rx(sdr->device,rx_callback,sdr);
@@ -609,8 +637,6 @@ static void *hydrasdr_monitor(void *p){
   return NULL;
 }
 
-
-static bool Name_set = false;
 // Callback called with incoming receiver data from A/D
 static int rx_callback(hydrasdr_transfer *transfer){
   assert(transfer != NULL);
@@ -625,47 +651,30 @@ static int rx_callback(hydrasdr_transfer *transfer){
   if(!Name_set){
     pthread_setname("hydrasdr-cb");
     Name_set = true;
-    realtime(2 + default_prio());
   }
   if(transfer->dropped_samples){
     fprintf(stderr,"dropped %'lld\n",(long long)transfer->dropped_samples);
   }
   int const sampcount = transfer->sample_count;
-  double in_energy = 0;
+  uint64_t in_energy = 0;
+  double energy = 0;
   switch(sdr->sample_type){
   case HYDRASDR_SAMPLE_RAW:
     {
-      // Libhydrasdr could do this for us, but this minimizes mem copies
-      // This could probably be vectorized someday
-      // Note: ad-hoc for 12 bits/sample.
-      // The Hydra API >= 1.1.2 provides the width explicitly, so we won't use this
-      // unless the width = 12 bits
-      uint32_t const * restrict up = (uint32_t *)transfer->samples;
       float * restrict wptr = frontend->in.input_write_pointer.r;
-      for(int i=0; i < sampcount; i+= 8){ // assumes multiple of 8
-	int s[8];
-	s[0] =  up[0] >> 20;
-	s[1] =  up[0] >> 8;
-	s[2] =  (up[0] << 4) | (up[1] >> 28);
-	s[3] =  up[1] >> 16;
-	s[4] =  up[1] >> 4;
-	s[5] =  (up[1] << 8) | (up[2] >> 24);
-	s[6] =  up[2] >> 12;
-	s[7] =  up[2];
-	for(int j=0; j < 8; j++){
-	  int const x = (s[j] & 0xfff) - 2048; // mask not actually necessary for s[0]
-	  if(x >= 2047 || x <= -2048){
-	    frontend->overranges++;
-	    frontend->samp_since_over = 0;
-	  } else {
-	    frontend->samp_since_over++;
-	  }
-	  wptr[j] = (float)(sdr->scale * x);
-	  in_energy += (double)x * x;
-	}
-	wptr += 8;
-	up += 3;
-      }
+      uint32_t const * restrict up = (uint32_t *)transfer->samples;
+      int over;
+#if defined(__x86_64__)
+      if(__builtin_cpu_supports("avx2") &&  __builtin_cpu_supports("popcnt"))
+	over = airspy_unpack_avx2(wptr,up,sampcount,(float)sdr->scale,&in_energy);
+      else
+#endif
+	over = airspy_unpack(wptr,up,sampcount,(float)sdr->scale,&in_energy);
+      if(over){
+	frontend->overranges += over;
+	frontend->samp_since_over = 0;
+      } else
+	frontend->samp_since_over += sampcount;
     }
     break;
   case HYDRASDR_SAMPLE_UINT16_REAL:
@@ -683,7 +692,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
 	  frontend->samp_since_over++;
 	}
 	*wptr++ = sdr->scale * x;
-	in_energy += (double)x * x;
+	in_energy += (int64_t)x * x;
       }
     }
     break;
@@ -700,7 +709,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
 	  frontend->samp_since_over++;
 	}
 	*wptr++ = sdr->scale * x;
-	in_energy += (double)x * x;
+	in_energy += (int64_t)x * x;
       }
     }
     break;
@@ -712,7 +721,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
       for(int i=0; i < sampcount; i++){
 	float const x = *up++;
 	*wptr++ = sdr->scale * x;
-	in_energy += (double)x * x;
+	energy += x * x;
       }
     }
     break;
@@ -731,7 +740,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
 	}
 	double complex s = CMPLX((double)x,(double)y);
 	*wptr++ = (float complex)(sdr->scale * s);
-	in_energy += cnrm(s);
+	in_energy += x * x + y * y;
       }
     }
     break;
@@ -742,7 +751,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
       for(int i=0; i < sampcount; i++){
 	double complex s = *up++;
 	*wptr++ = (float complex)(sdr->scale * s);
-	in_energy += cnrm(s);
+	energy += cnrm(s);
       }
     }
     break;
@@ -759,7 +768,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
 	  frontend->samp_since_over++;
 	}
 	*wptr++ = sdr->scale * x;
-	in_energy += (double)x * x;
+	in_energy += (int64_t)x * x;
       }
     }
     break;
@@ -776,7 +785,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
 	  frontend->samp_since_over++;
 	}
 	*wptr++ = sdr->scale * x;
-	in_energy += (double)x * x;
+	in_energy += (int64_t)x * x;
       }
     }
     break;
@@ -795,7 +804,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
 	}
 	double complex s = CMPLX((double)x,(double)y);
 	*wptr++ = sdr->scale * s;
-	in_energy += cnrm(s);
+	in_energy += x * x + y * y;
       }
     }
     break;
@@ -814,7 +823,7 @@ static int rx_callback(hydrasdr_transfer *transfer){
 	}
 	double complex s = CMPLX((double)x,(double)y);
 	*wptr++ = sdr->scale * s;
-	in_energy += cnrm(s);
+	in_energy += x * x + y * y;
       }
     }
     break;
@@ -827,11 +836,15 @@ static int rx_callback(hydrasdr_transfer *transfer){
   else
     write_cfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT
 
-  if(sampcount != 0 && !isnan(in_energy) && isfinite(in_energy))
-    frontend->if_power += Power_alpha * (in_energy / sampcount - frontend->if_power);
+  if(sampcount != 0){
+    if(in_energy != 0)
+      energy = (double)in_energy; // energy was accumulated as integer, otherwise as double for floating formats
+    if(isfinite(energy))
+       frontend->if_power += Power_alpha * (energy / sampcount - frontend->if_power);
+  }
   if(sdr->software_agc){
     // Integrate A/D energy over A/D averaging period
-    sdr->agc_energy += in_energy;
+    sdr->agc_energy += energy;
     sdr->agc_samples += sampcount;
     if(sdr->agc_samples >= frontend->samprate/10){ // Time to re-evaluate after 100 ms
       double avg_agc_power = scale_ADpower2FS(frontend) * sdr->agc_energy / sdr->agc_samples;

@@ -22,4 +22,3 @@ ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="60a1"
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1fc9", ATTR{idProduct}=="000c", SYMLINK+="nxp-dfu-%k", MODE="0660", GROUP="plugdev", TAG+="uaccess", TAG+="udev-acl"
 # Fallback rule for distributions without plugdev group (Red Hat/SUSE/Arch family)
 ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="1fc9", ATTR{idProduct}=="000c", SYMLINK+="nxp-dfu-%k", MODE="0664", GROUP="users", TAG+="uaccess"
-

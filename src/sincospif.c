@@ -4,7 +4,6 @@
 // rather than radians, especially in repeated complex multiplication
 // Copyright 2026 Phil Karn, KA9Q
 
-#define _GNU_SOURCE 1
 #include <math.h>
 #include <stdbool.h>
 
@@ -23,7 +22,7 @@ static inline double mod2f(double x) {
 __attribute__((weak))
 void sincospif(float x, float *s, float *c)
 {
-  if (isnan(x) || !isfinite(x)) { *s = *c = NAN; return; }
+  if (!isfinite(x)) { *s = *c = NAN; return; }
 
     // sin(pi*x), cos(pi*x) have period 2 in x
     float y = mod2f(x);        // [0,2)

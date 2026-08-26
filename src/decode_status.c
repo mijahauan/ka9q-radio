@@ -3,27 +3,30 @@
 // share internal data structures with radiod
 // Copyright 2026 Phil Karn, KA9Q
 
-#define _GNU_SOURCE 1
 #include <string.h>
 #include "radio.h"
 
 // Decode incoming status message from the radio program, convert and fill in fields in local channel structure
 // Leave all other fields unchanged, as they may have local uses (e.g., file descriptors)
 // Note that we use some fields in channel differently than in radiod (e.g., dB vs ratios)
-int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_t const *buffer,size_t length){
+int decode_radio_status(struct frontend *frontend,chan_t *channel,uint8_t const *buffer,int length){
   if(frontend == NULL || channel == NULL || buffer == NULL)
     return -1;
+  if(length <= 0)
+    return 0;
   uint8_t const *cp = buffer;
-  while(cp  < &buffer[length]){
+  while(cp  < &buffer[length-1]){ // ensure at least 2 bytes for type & length
     enum status_type type = *cp++; // increment to length field
-
     if(type == EOL)
       break; // end of list
-
     unsigned int optlen = *cp++;
     if(optlen & 0x80){
       // length is >= 128 bytes; fetch actual length from next N bytes, where N is low 7 bits of optlen
       int length_of_length = optlen & 0x7f;
+      // Reject implausible or overflowing lengths, and ensure the length
+      // bytes themselves fit in the remaining packet.
+      if(length_of_length > (int)sizeof(optlen) || cp + length_of_length > &buffer[length])
+	break;
       optlen = 0;
       while(length_of_length > 0){
 	optlen <<= 8;
@@ -31,8 +34,8 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
 	length_of_length--;
       }
     }
-    if(cp >= &buffer[length])
-      break; // invalid length; we can't continue to scan
+    if(cp + optlen > &buffer[length])
+      break; // value would run past end of packet
     switch(type){
     case EOL:
       break;
@@ -42,7 +45,8 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
     case DESCRIPTION:
       {
 	char *str = decode_string(cp,optlen);
-	strlcpy(frontend->description,str,sizeof(frontend->description)); // should enforce null termination
+	if(str != NULL)
+	  strlcpy(frontend->description,str,sizeof(frontend->description));
 	FREE(str);
       }
       break;
@@ -207,7 +211,7 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
       channel->output.channels = decode_int(cp,optlen);
       break;
     case INDEPENDENT_SIDEBAND:
-      channel->filter2.isb = decode_bool(cp,optlen);
+      channel->filter2.out.isb = decode_bool(cp,optlen);
       break;
     case THRESH_EXTEND:
       channel->fm.threshold = decode_bool(cp,optlen);
@@ -303,7 +307,8 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
     case PRESET:
       {
 	char *p = decode_string(cp,optlen);
-	strlcpy(channel->preset,p,sizeof(channel->preset)); // should enforce null termination
+	if(p != NULL)
+	  strlcpy(channel->preset,p,sizeof(channel->preset));
 	FREE(p);
       }
       break;
@@ -369,19 +374,20 @@ int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_
   return 0;
 }
 // Extract SSRC; 0 means not present (reserved value)
-uint32_t get_ssrc(uint8_t const *buffer,size_t length){
+uint32_t get_ssrc(uint8_t const *buffer,int length){
+  if(length < 2)
+    return 0;
   uint8_t const *cp = buffer;
-
-  while(cp < &buffer[length]){
+  while(cp < &buffer[length-1]){
     enum status_type const type = *cp++; // increment cp to length field
-
     if(type == EOL)
       break; // end of list, no length
-
     unsigned int optlen = *cp++;
     if(optlen & 0x80){
       // length is >= 128 bytes; fetch actual length from next N bytes, where N is low 7 bits of optlen
       int length_of_length = optlen & 0x7f;
+      if(length_of_length > (int)sizeof(optlen) || cp + length_of_length > &buffer[length])
+	break;
       optlen = 0;
       while(length_of_length > 0){
 	optlen <<= 8;
@@ -389,9 +395,8 @@ uint32_t get_ssrc(uint8_t const *buffer,size_t length){
 	length_of_length--;
       }
     }
-    if(cp + optlen >= buffer + length)
+    if(cp + optlen >= &buffer[length])
       break; // invalid length; we can't continue to scan
-
     switch(type){
     case EOL: // Shouldn't get here
       goto done;
@@ -407,19 +412,20 @@ uint32_t get_ssrc(uint8_t const *buffer,size_t length){
   return 0;
 }
 // Extract command tag
-uint32_t get_tag(uint8_t const *buffer,size_t length){
+uint32_t get_tag(uint8_t const *buffer,int length){
+  if(length < 2)
+    return 0;
   uint8_t const *cp = buffer;
-
-  while(cp < buffer + length){
+  while(cp < &buffer[length-1]){
     enum status_type const type = *cp++; // increment cp to length field
-
     if(type == EOL)
       break; // end of list, no length
-
     unsigned int optlen = *cp++;
     if(optlen & 0x80){
       // length is >= 128 bytes; fetch actual length from next N bytes, where N is low 7 bits of optlen
       int length_of_length = optlen & 0x7f;
+      if(length_of_length > (int)sizeof(optlen) || cp + length_of_length > &buffer[length])
+	break;
       optlen = 0;
       while(length_of_length > 0){
 	optlen <<= 8;
@@ -427,9 +433,8 @@ uint32_t get_tag(uint8_t const *buffer,size_t length){
 	length_of_length--;
       }
     }
-    if(cp + optlen >= buffer + length)
+    if(cp + optlen >= &buffer[length])
       break; // invalid length; we can't continue to scan
-
     switch(type){
     case EOL: // Shouldn't get here
       goto done;

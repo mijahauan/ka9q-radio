@@ -2,12 +2,13 @@
 // Copyright 2023, Phil Karn, KA9Q
 
 #undef DEBUG_AGC
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <libairspy/airspy.h>
 #include <errno.h>
 #include <iniparser/iniparser.h>
+#include <string.h>
 #if defined(linux)
 #include <bsd/string.h>
 #endif
@@ -21,6 +22,9 @@
 #include "status.h"
 #include "radio.h"
 #include "config.h"
+#include "airspy.h"
+#include "sched.h"
+#include "defaults.h"
 
 // Global variables set by config file options
 extern int Verbose;
@@ -96,7 +100,7 @@ static char const *Airspy_keys[] = {
 NULL
 };
 
-
+static bool Name_set = false;
 static double Power_alpha = 0.05; // Calculate this properly someday
 static double set_correct_freq(struct sdrstate *sdr,double freq);
 static int rx_callback(airspy_transfer *transfer);
@@ -128,27 +132,27 @@ int airspy_setup(struct frontend * const frontend,dictionary * const Dictionary,
   {
     // Determine the serial number we'll look for
     sdr->SN = 0;
-    if(Serial != NULL){
-      // Specified on command line
-      long long serial_number_arg = 0;
-      if(sscanf(Serial,"AIRSPY_SN:%llx",&serial_number_arg) != 1){
-	fprintf(stderr,"Invalid serial number argument %s\n",Serial);
-      } else {
-	sdr->SN = serial_number_arg;
-      }
+    extern char const *Serial; // Defined in main.c, set from -s on command line
+    char const *sn = NULL;
+    if(Serial != NULL && strlen(Serial) > 0){
+      fprintf(stderr,"Serial '%s' specified on command line\n",Serial);
+      sn = Serial;
+      char const *colon = strchr(sn,':');
+      if(colon != NULL)
+	sn = colon+1;
+      char *endptr = NULL;
+      sdr->SN = strtoull(sn,&endptr,16);
+      if(endptr == NULL || *endptr != '\0')
+	fprintf(stderr,"Invalid serial number %s in section %s\n",sn,section);
     }
-    if(sdr->SN == 0){
-      // examine only if not already given on command line
-      char const * const sn = config_getstring(Dictionary,section,"serial",NULL);
-      if(sn != NULL){
-	char *endptr = NULL;
-	sdr->SN = strtoull(sn,&endptr,16);
-	if(endptr == NULL || *endptr != '\0'){
-	  fprintf(stderr,"Invalid serial number %s in section %s\n",sn,section);
-	  return -1;
-	}
-      }
+    // If not successfully set from command line, use keyword in config file, if any
+    if(sdr->SN == 0 && (sn = config_getstring(Dictionary,section,"serial",NULL)) != NULL){
+      char *endptr = NULL;
+      sdr->SN = strtoull(sn,&endptr,16);
+      if(endptr == NULL || *endptr != '\0')
+	fprintf(stderr,"Invalid serial number %s in section %s\n",sn,section);
     }
+    // If it still hasn't been set, enumerate and pick one
     if(sdr->SN == 0){
       // Specific serial number not specified, enumerate and pick the first one
       int n_serials = 100; // ridiculously large
@@ -159,11 +163,13 @@ int airspy_setup(struct frontend * const frontend,dictionary * const Dictionary,
 	fprintf(stderr,"No airspy devices found\n");
 	return -1;
       }
+      flockfile(stderr);
       fprintf(stderr,"Discovered airspy device serial%s:",n_serials > 1 ? "s" : "");
       for(int i = 0; i < n_serials; i++){
 	fprintf(stderr," %llx",(long long)serials[i]);
       }
       fprintf(stderr,"\n");
+      funlockfile(stderr);
       fprintf(stderr,"Selecting %llx by default; to select another, add -snn to command line or 'serial = ' to config file\n",(long long)serials[0]);
       sdr->SN = serials[0];
     }
@@ -206,6 +212,7 @@ int airspy_setup(struct frontend * const frontend,dictionary * const Dictionary,
       fprintf(stderr,"error, no valid sample rates!\n");
       return -1;
     }
+    flockfile(stderr);
     fprintf(stderr,"%'d sample rate%s:",number_sample_rates,number_sample_rates > 1 ? "s":"");
     ret = airspy_get_samplerates(sdr->device,sdr->sample_rates,number_sample_rates);
     assert(ret == AIRSPY_SUCCESS);
@@ -215,6 +222,7 @@ int airspy_setup(struct frontend * const frontend,dictionary * const Dictionary,
 	break;
     }
     fprintf(stderr,"\n");
+    funlockfile(stderr);
   }
   {
     frontend->samprate = sdr->sample_rates[0];  // Default to first (highest) sample rate on list
@@ -355,7 +363,6 @@ static void *airspy_monitor(void *p){
   struct sdrstate * const sdr = (struct sdrstate *)p;
   assert(sdr != NULL);
   pthread_setname("airspy-mon");
-  realtime(2 + default_prio()); // Doesn't seem to work
   stick_core();
 
   int ret = airspy_start_rx(sdr->device,rx_callback,sdr);
@@ -376,9 +383,6 @@ static void *airspy_monitor(void *p){
   return 0;
 }
 
-
-static bool Name_set = false;
-// Callback called with incoming receiver data from A/D
 static int rx_callback(airspy_transfer *transfer){
   assert(transfer != NULL);
   struct sdrstate * const sdr = (struct sdrstate *)transfer->ctx;
@@ -392,48 +396,34 @@ static int rx_callback(airspy_transfer *transfer){
   if(!Name_set){
     pthread_setname("airspy-cb");
     Name_set = true;
-    realtime(2 + default_prio());
   }
-  if(transfer->dropped_samples){
+  if(transfer->dropped_samples)
     fprintf(stderr,"dropped %'lld\n",(long long)transfer->dropped_samples);
-  }
+
   assert(transfer->sample_type == AIRSPY_SAMPLE_RAW);
   int const sampcount = transfer->sample_count;
   float * wptr = frontend->in.input_write_pointer.r;
   uint32_t const *up = (uint32_t *)transfer->samples;
   assert(wptr != NULL);
   assert(up != NULL);
-  double in_energy = 0;
-  // Libairspy could do this for us, but this minimizes mem copies
-  // This could probably be vectorized someday
-  for(int i=0; i < sampcount; i+= 8){ // assumes multiple of 8
-    int s[8];
-    s[0] =  up[0] >> 20;
-    s[1] =  up[0] >> 8;
-    s[2] =  (up[0] << 4) | (up[1] >> 28);
-    s[3] =  up[1] >> 16;
-    s[4] =  up[1] >> 4;
-    s[5] =  (up[1] << 8) | (up[2] >> 24);
-    s[6] =  up[2] >> 12;
-    s[7] =  up[2];
-    for(int j=0; j < 8; j++){
-      int const x = (s[j] & 0xfff) - 2048; // mask not actually necessary for s[0]
-      if(x == 2047 || x <= -2047){
-	frontend->overranges++;
-	frontend->samp_since_over = 0;
-      } else {
-	frontend->samp_since_over++;
-      }
-      wptr[j] = (float)(sdr->scale * x);
-      in_energy += (double)x * x;
-    }
-    wptr += 8;
-    up += 3;
-  }
+  uint64_t in_energy = 0;
+  int over;
+#if defined(__x86_64__)
+  if(__builtin_cpu_supports("avx2") &&  __builtin_cpu_supports("popcnt"))
+    over = airspy_unpack_avx2(wptr,up,sampcount,(float)sdr->scale,&in_energy);
+  else
+#endif
+    over = airspy_unpack(wptr,up,sampcount,(float)sdr->scale,&in_energy);
+  if(over){
+    frontend->overranges += over;
+    frontend->samp_since_over = 0;
+  } else
+    frontend->samp_since_over += sampcount;
+
   frontend->samples += sampcount;
   write_rfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT
-  if(sampcount != 0 && !isnan(in_energy) && isfinite(in_energy))
-    frontend->if_power += Power_alpha * (in_energy / sampcount - frontend->if_power);
+  if(sampcount != 0)
+    frontend->if_power += Power_alpha * ((double)in_energy / sampcount - frontend->if_power);
   if(sdr->software_agc){
     // Integrate A/D energy over A/D averaging period
     sdr->agc_energy += in_energy;

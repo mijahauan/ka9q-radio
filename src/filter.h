@@ -19,19 +19,16 @@ extern char const *Wisdom_file;
 extern int Nthreads;
 extern int FFTW_planning_level;
 extern double FFTW_plan_timelimit;
-extern pthread_mutex_t FFTW_planning_mutex;
 extern int N_internal_threads;
 extern int N_worker_threads; // owned by filter.c
 extern char const *Wisdom_file;
 
 // Input can be REAL or COMPLEX
-// Output can be REAL, COMPLEX, BEAM or SPECTRUM
-// BEAM is for selecting independent I or Q from complex input or for
+// Output can be REAL, COMPLEX, SPECTRUM
 // beamforming when I and Q are from independent antennas
 enum filtertype {
   NONE,
   COMPLEX,
-  BEAM, // Input pseudo-complex: two real signals in I and Q
   REAL,
   SPECTRUM, // On output only
 };
@@ -50,7 +47,7 @@ struct notch_state {
 
 #define ND 4
 struct filter_in {
-  enum filtertype in_type;           // REAL, COMPLEX, BEAM
+  enum filtertype in_type;           // REAL, COMPLEX
   int points;               // Size of FFT N = L + M - 1. For complex, == N
   int ilen;                 // Length of user portion of input buffer, aka 'L'
   int bins;                 // Total number of frequency bins. Complex: L + M - 1;  Real: (L + M - 1)/2 + 1
@@ -72,11 +69,13 @@ struct filter_in {
   bool perform_inline;       // Perform FFT inline, don't use worker threads (better for small FFTs)
   uint64_t sample_index;     // input sample index at start of buffer
   uint64_t samples_by_job[ND];
+  bool init;
+  pthread_t owner;           // thread ID of writer to this filter, disables waits when read in same thread
 };
 
 struct filter_out {
   struct filter_in * master;
-  enum filtertype out_type;          // REAL, COMPLEX, BEAM, SPECTRUM
+  enum filtertype out_type;          // REAL, COMPLEX, SPECTRUM
   int points;               // Size N of fft; Same as bins only for complex
   int olen;                 // Length of user portion of output buffer (decimated L)
   int bins;                 // Number of frequency bins; == N for complex, == N/2 + 1 for real output
@@ -92,10 +91,13 @@ struct filter_out {
   unsigned block_drops;          // Lost frequency domain blocks, e.g., from late scheduling of slave thread
   int rcnt;                 // Samples read from output buffer
   uint64_t sample_index;     // input sample index at start of buffer
+  bool beam;                 // Use complex weights alpha and beta
+  bool isb;                  // Unpack LSB and USB -> I and Q
+  bool init;                 // response_mutex has been initialized
 };
 
 int create_filter_input(struct filter_in *,int const L,int const M, enum filtertype const in_type);
-int create_filter_output(struct filter_out * restrict slave,struct filter_in * restrict master,float complex * restrict response,int olen, enum filtertype out_type);
+int create_filter_output(struct filter_out * restrict slave,struct filter_in * restrict master,int olen, enum filtertype out_type);
 int execute_filter_input(struct filter_in *);
 int execute_filter_output(struct filter_out * ,int);
 int delete_filter_input(struct filter_in *);
@@ -110,6 +112,7 @@ long lcm(long a,long b);
 fftwf_plan plan_complex(int N, float complex *in, float complex *out, int direction);
 fftwf_plan plan_r2c(int N, float *in, float complex *out);
 fftwf_plan plan_c2r(int N, float complex *in, float *out);
+void destroy_plan(fftwf_plan *plan);
 bool goodchoice(long);
 int ceil_pow2(uint32_t x);
 int set_filter_weights(struct filter_out *out,double complex i_weight, double complex q_weight);

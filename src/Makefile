@@ -57,7 +57,11 @@ ifeq ($(UNAME_S),Darwin)
   MACPREFIX ?= $(if $(wildcard /opt/local/include),/opt/local,$(shell brew --prefix 2>/dev/null))
   INCLUDES += -I$(MACPREFIX)/include
   LDFLAGS  += -L$(MACPREFIX)/lib
-  # Homebrew's ncurses is keg-only; add its paths if present
+  # gettext and ncurses are keg-only in Homebrew; add their paths if present
+  ifneq ($(wildcard $(MACPREFIX)/opt/gettext),)
+    INCLUDES += -I$(MACPREFIX)/opt/gettext/include
+    LDFLAGS  += -L$(MACPREFIX)/opt/gettext/lib
+  endif
   ifneq ($(wildcard $(MACPREFIX)/opt/ncurses),)
     INCLUDES += -I$(MACPREFIX)/opt/ncurses/include
     LDFLAGS  += -L$(MACPREFIX)/opt/ncurses/lib
@@ -66,6 +70,7 @@ ifeq ($(UNAME_S),Darwin)
   # .so link rules use SOFLAGS but not LDFLAGS, so the library path goes here too
   SOFLAGS += -bundle -Wl,-undefined,dynamic_lookup -L$(MACPREFIX)/lib
 else
+  # linux
   LDLIBS += -lbsd -lrt
   SOFLAGS += -shared
   RDYNAMIC = -rdynamic
@@ -98,9 +103,9 @@ ENABLE_SIG_GEN  ?= 1
 endif
 
 ifeq ($(BUILD),debug)
-     DOPTS = -g
+     DOPTS += -g
 else
-     DOPTS = -DNDEBUG=1 -O3
+     DOPTS += -DNDEBUG=1 -O3
 endif
 
 ifeq ($(NATIVE),1)
@@ -108,96 +113,93 @@ ARCHOPTS = -march=native
 endif
 
 # do NOT set -ffast-math or -ffinite-math-only; NANs are widely used as 'variable not set' sentinels
-COPTS = -std=gnu11 -pthread -Wall -funsafe-math-optimizations -fno-math-errno -fcx-limited-range -freciprocal-math -fno-trapping-math -Wextra -Wno-sign-conversion -Wno-int-conversion -MMD -MP
-COPTS += -fPIC
+COPTS = -std=gnu11 -pthread -Wall -funsafe-math-optimizations -fno-math-errno -freciprocal-math -fno-trapping-math -ffp-contract=fast -Wextra -MMD -MP -fPIC
+# -fcx-limited-range is supposedly unsupported in clang, but I don't have that problem
+ifeq ($(IS_GCC_NOT_CLANG),yes)
+COPTS += -fcx-limited-range -D_GNU_SOURCE=1
+endif
+
 CFLAGS += $(DOPTS) $(ARCHOPTS) $(COPTS) $(INCLUDES)
 
 DAEMONS = aprs aprsfeed cwd packetd radiod
 EXECS = ctcss control fft-gen jt-decoded metadump monitor opussend pcmrecord pcmsend powers tune wd-record
 
 ## library elements
-LIBRADIO = misc.o multicast.o rtp.o config.o
+LIBRADIO = misc.o multicast.o rtp.o config.o sched.o
 LIBDSP = filter.o iir.o window.o osc.o sincospi.o sincospif.o
 LIBSTATUS = status.o decode_status.o
 
 # radiod uses a lot of unique objects. It should probably move to its own directory
-RADIOD_OBJECTS = main.o audio.o avahi.o modes.o fm.o wfm.o linear.o spectrum.o radio.o radio_status.o rtcp.o libdsp.a libstatus.a libradio.a
+RADIOD_OBJECTS = main.o audio.o avahi.o modes.o fm.o wfm.o linear.o spectrum.o radio.o n0.o radio_status.o rtcp.o libdsp.a libstatus.a libradio.a
 
 ## source files for dependency generation (see DEPS=)
-CFILES = airspy.c airspyhf.c aprs.c aprsfeed.c attr.c audio.c avahi.c avahi_browse.c ax25.c bandplan.c config.c control.c cwd.c decimate.c decode_status.c dump.c ezusb.c fcd.c filter.c fm.c funcube.c hid-libusb.c iir.c jt-decoded.c linear.c main.c metadump.c misc.c modes.c monitor.c monitor-data.c monitor-display.c monitor-repeater.c morse.c multicast.c opusd.c opussend.c osc.c packetd.c pcmcat.c pcmrecord.c pcmsend.c pcmspawn.c ctcss.c powers.c radio.c radio_status.c rdsd.c rtcp.c rtlsdr.c rtp.c rx888.c setfilt.c show-pkt.c show-sig.c si5351.c sig_gen.c spectrum.c status.c stereod.c tune.c wd-record.c wfm.c
-HFILES = attr.h ax25.h bandplan.h conf.h config.h decimate.h ezusb.h fcd.h fcdhidcmd.h filter.h hidapi.h iir.h misc.h monitor.h morse.h multicast.h osc.h radio.h rx888.h si5351.h status.h config_paths.h
+# List every .c file in the tree so `-include $(DEPS)` picks up
+# header-change rebuild dependencies even for optional drivers
+# (bladerf, fobos, hackrf, hydrasdr, sdrplay, ...) whose targets
+# are gated by ENABLE_*.
+CFILES = airspy.c airspyhf.c aprs.c aprsfeed.c attr.c audio.c avahi.c avahi_browse.c ax25.c bandplan.c bladerf.c config.c control.c cwd.c decimate.c decode_status.c dump.c ezusb.c fcd.c fft-gen.c filter.c fm.c fobos.c funcube.c gauss.c hackrf.c hid-libusb.c hydrasdr.c iir.c jt-decoded.c linear.c main.c metadump.c misc.c modes.c monitor.c monitor-data.c monitor-display.c monitor-repeater.c morse.c multicast.c n0.c opusd.c opussend.c osc.c packetd.c pcmcat.c pcmrecord.c pcmsend.c pcmspawn.c ctcss.c powers.c radio.c radio_status.c rdsd.c rtcp.c rtlsdr.c rtp.c rx888.c rx888_boot.c sdrplay.c set_xcvr.c setfilt.c show-pkt.c show-sig.c si5351.c sig_gen.c spectrum.c status.c stereod.c sincospi.c sincospif.c tune.c wd-record.c wfm.c window.c
+
+HFILES = attr.h ax25.h bandplan.h conf.h config.h decimate.h defaults.h ezusb.h fcd.h fcdhidcmd.h filter.h hidapi.h iir.h misc.h monitor.h morse.h multicast.h osc.h radio.h rx888.h si5351.h status.h config_paths.h
 
 ## hardware plug-in module enables
 # The software signal generator front end is build by default. Others are added by the ENABLE_* options below
-DYNAMIC_DRIVERS = 
+DYNAMIC_DRIVERS =
 
 # AIRSPY R2, etc
 ifeq ($(ENABLE_AIRSPY),1)
-   CFILES += airspy.c
    DYNAMIC_DRIVERS += airspy.so
 endif
 
 # AIRSPY HF+
 ifeq ($(ENABLE_AIRSPYHF),1)
-   CFILES += airspyhf.c
    DYNAMIC_DRIVERS += airspyhf.so
 endif
 
 # BLADERF
 ifeq ($(ENABLE_BLADERF),1)
-   CFILES += bladerf.c
    DYNAMIC_DRIVERS += bladerf.so
 endif
 
 # Rigexpert Fobos SDR
 ifeq ($(ENABLE_FOBOS),1)
-   CFILES += fobos.c
    DYNAMIC_DRIVERS += fobos.so
 endif
 
 # Old AMSAT-UK Funcube dongle (my first SDR!)
 ifeq ($(ENABLE_FUNCUBE),1)
-   CFILES += funcube.c
    DYNAMIC_DRIVERS += funcube.so
 endif
 
 # HACK RF
 ifeq ($(ENABLE_HACKRF),1)
-   CFILES += hackrf.c
    DYNAMIC_DRIVERS += hackrf.so
 endif
 
 # HydraSDR One
 ifeq ($(ENABLE_HYDRASDR),1)
-   CFILES += hydrasdr.c
    DYNAMIC_DRIVERS += hydrasdr.so
 endif
 
 # cheap RTLSDR dongles
 ifeq ($(ENABLE_RTLSDR),1)
-   CFILES += rtlsdr.c
    DYNAMIC_DRIVERS += rtlsdr.so
 endif
 
 # RX 888 MkII
 ifeq ($(ENABLE_RX888),1)
-   CFILES += rx888.c rx888_boot.c
    DYNAMIC_DRIVERS += rx888.so
    DAEMONS += rx888_boot
 endif
 
 ifeq ($(ENABLE_SDRPLAY),1)
-   CFILES += sdrplay.c
    DYNAMIC_DRIVERS += sdrplay.so
 endif
 
 ifeq ($(ENABLE_SIG_GEN),1)
-   CFILES += sig_gen.c
    DYNAMIC_DRIVERS += sig_gen.so
 endif
 
 ifeq ($(HAS_PIGPIO),1)
-   CFILES += set_xcvr.c
    EXECS += set_xcvr
 endif
 
@@ -211,7 +213,7 @@ install: all
 	install -m 0755 $(DAEMONS) $(DESTDIR)$(sbindir)
 	install -m 0755 $(EXECS) $(DESTDIR)$(bindir)
 ifeq ($(strip $(DEB_BUILD_ARCH))$(UNAME_S),Linux)
-	setcap cap_net_admin+ep $(bindir)/monitor
+	setcap cap_net_admin+ep $(DESTDIR)$(bindir)/monitor
 endif
 
 clean:
@@ -329,37 +331,37 @@ wd-record: wd-record.o libstatus.a attr.o libradio.a
 
 ## Dynamically loaded modules for SDR front ends
 funcube.so: funcube.o fcd.o hid-libusb.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lportaudio -lusb-1.0 $(LDLIBS)
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lportaudio -lusb-1.0 $(LDLIBS)
 
 rx888.so: rx888.o si5351.o ezusb.o hid-libusb.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lusb-1.0 $(LDLIBS)
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lusb-1.0 $(LDLIBS)
 
-airspy.so: airspy.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lairspy $(LDLIBS)
+airspy.so: airspy.o airspy-unpack.o
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lairspy $(LDLIBS)
 
 airspyhf.so: airspyhf.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lairspyhf $(LDLIBS)
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lairspyhf $(LDLIBS)
 
-hydrasdr.so: hydrasdr.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lhydrasdr $(LDLIBS)
+hydrasdr.so: hydrasdr.o airspy-unpack.o
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lhydrasdr $(LDLIBS)
 
 rtlsdr.so: rtlsdr.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lrtlsdr $(LDLIBS)
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lrtlsdr $(LDLIBS)
 
 sdrplay.so: sdrplay.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lsdrplay_api $(LDLIBS)
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lsdrplay_api $(LDLIBS)
 
 fobos.so: fobos.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lfobos $(LDLIBS)
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lfobos $(LDLIBS)
 
 hackrf.so: hackrf.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lhackrf -lusb-1.0 $(LDLIBS)
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lhackrf -lusb-1.0 $(LDLIBS)
 
 bladerf.so: bladerf.o
-	$(CC) $(SOFLAGS) -o $@ $^ -lbladeRF $(LDLIBS)
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lbladeRF $(LDLIBS)
 
 sig_gen.so: sig_gen.o gauss.o libradio.a
-	$(CC) $(SOFLAGS) -o $@ $^ -lsamplerate $(LDLIBS)
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $^ -lsamplerate $(LDLIBS)
 
 # subroutines useful in more than one program
 # subroutines useful in more than one program
@@ -395,7 +397,7 @@ config_paths.h: Makefile
 	@printf '#endif\n' >> $@
 
 %.so: %.o
-	$(CC) $(SOFLAGS) -o $@ $<
+	$(CC) $(LDFLAGS) $(SOFLAGS) -o $@ $<
 
 %.o: %.c config_paths.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<

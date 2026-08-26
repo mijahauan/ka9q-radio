@@ -25,10 +25,6 @@
         http://github.com/signal11/hidapi .
 ********************************************************/
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE /* needed for wcsdup() before glibc 2.10 */
-#endif
-
 /* C */
 #include <stdio.h>
 #include <string.h>
@@ -133,6 +129,8 @@ static hid_device *new_hid_device(void)
 {
 	hid_device *dev = calloc(1, sizeof(hid_device));
 	assert(dev != NULL);
+	if(dev == NULL)
+	  return NULL;
 	dev->blocking = 1;
 
 	pthread_mutex_init(&dev->mutex, NULL);

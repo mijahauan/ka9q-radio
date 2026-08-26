@@ -1,3 +1,4 @@
+
 // Internal structures and functions of the 'ka9q-radio' package
 // Nearly all internal state is in the 'demod' structure
 // More than one can exist in the same program,
@@ -16,6 +17,8 @@
 #include <iniparser/iniparser.h>
 #include <dlfcn.h>
 #include <opus/opus.h>
+#include <stdatomic.h>
+#include <fftw3.h>
 
 #include "config.h"
 #include "multicast.h"
@@ -26,17 +29,17 @@
 #include "iir.h"
 #include "window.h"
 
-
-
 /**
    @brief The four demodulator types
  */
 enum demod_type {
+  INVALID_DEMOD = -1,   // used as sentinel
   LINEAR_DEMOD = 0,     // Linear demodulation, i.e., everything else: SSB, CW, DSB, CAM, IQ
   FM_DEMOD,             // Frequency/phase demodulation
   WFM_DEMOD,            // wideband frequency modulation (broadcast stereo)
   SPECT_DEMOD,          // Spectrum analysis pseudo-demod
   SPECT2_DEMOD,         // spectrum v2: 8-bit log bins, low-to-high order
+  IDLE_DEMOD,           // placeholder that just processes commands
   N_DEMOD,              // Dummy equal to number of valid entries
 };
 
@@ -50,7 +53,7 @@ struct demodtab {
   char name[16];
 };
 
-extern struct demodtab Demodtab[];
+extern struct demodtab const Demodtab[];
 
 char const *demod_name_from_type(enum demod_type type);
 int demod_type_from_name(char const *name);
@@ -115,11 +118,9 @@ struct frontend {
   pthread_mutex_t status_mutex;
   pthread_cond_t status_cond;     // Signalled whenever status changes
 
-
-
   // Entry points for local front end driver
   void *context;         // Stash hardware-dependent control block
-  int (*setup)(struct frontend *,dictionary *,char const *); // Get front end ready to go
+  int (*setup)(struct frontend *,dictionary const *,char const *); // Get front end ready to go
   int (*start)(struct frontend *);          // Start front end sampling
   int (*shutdown)(struct frontend *);           // Stop front end, used when there are no channels. Optional for now.
   double (*tune)(struct frontend *,double); // Tune front end, return actual frequency
@@ -141,8 +142,15 @@ Be careful with memcpy(): there are a few pointers (spectrum.bin_data, status.co
 If you use these in shadow copies you must malloc these arrays yourself.
 */
 struct channel {
-  bool inuse;
+  _Atomic enum {
+    CHANNEL_IDLE = 0,
+    CHANNEL_STARTING,
+    CHANNEL_RUNNING,
+    CHANNEL_STOPPING
+  } state;               // prevents races when creating and deleting
   char name[100];
+  bool advertise;        // Enable avahi advertising of services
+  bool use_dns;
   struct frontend *frontend; // Linkage to avoid global use
 
   int lifestart;         // Initial lifetime, frames
@@ -164,14 +172,13 @@ struct channel {
   struct {
     struct filter_out out;
     double min_IF;          // Edges of filter (settable)
-    double max_IF;         // (settable)
-    // Window shape factor for Kaiser window
-    double kaiser_beta;  // settable
-    int bin_shift;      // FFT bin shift for frequency conversion
-    double remainder;   // Frequency remainder for fine tuning
+    double max_IF;          // (settable)
+    double kaiser_beta;     // shape factor for filter window
+    int bin_shift;          // FFT bin shift for frequency conversion
+    double remainder;       // Frequency remainder for fine tuning
     double complex phase_adjust; // Block rotation of phase
-    bool beam;          // Use beamforming on independent I&Q inputs
-    double complex a_weight; // A & B weights when beamforming
+    bool beam;              // Use beamforming on independent I&Q inputs
+    double complex a_weight;// A & B weights when beamforming
     double complex b_weight;
   } filter;
 
@@ -182,29 +189,28 @@ struct channel {
     double low;
     double high;
     double kaiser_beta;
-    bool isb;
-    int blocking;       // Ratio of output to input blocksize; 0 = filter2 disabled
+    int blocking;  // Ratio of output to input blocksize; 0 = filter2 disabled
   } filter2;
 
-  enum demod_type demod_type;  // Index into demodulator table (Linear, FM, FM Stereo, Spectrum)
-  char preset[32];       // name of last mode preset
-  float complex *baseband; // Output of filter or filter 2 as appropriate
+  enum demod_type demod_type;  // Index into demodulator table (Linear, FM, FM Stereo, Spectrum, Idle)
+  char preset[32];         // name of last mode preset
+  float complex *baseband; // Output buffer of filter or filter 2 as appropriate
   int sampcount;           // Count of baseband samples
 
   struct {               // Used only in linear demodulator
     bool env;            // Envelope detection in linear mode (settable)
     bool agc;            // Automatic gain control enabled (settable)
-    double hangtime;      // AGC hang time, seconds (settable)
-    double recovery_rate; // AGC recovery rate, amplitude ratio/sample  (settable)
-    double threshold;     // AGC threshold above noise, amplitude ratio
+    double hangtime;     // AGC hang time, seconds (settable)
+    double recovery_rate;// AGC recovery rate, amplitude ratio/sample  (settable)
+    double threshold;    // AGC threshold above noise, amplitude ratio
     int hangcount;       // AGC hang timer before gain recovery starts (samples)
-    double dc_tau;     // alpha for simple IIR carrier (DC) removal
+    double dc_alpha;     // alpha for simple IIR carrier (DC) removal
   } linear;
 
   struct {
     bool snr_enable; // Use raw SNR for AM/SSB/FM squelch
-    double open;      // squelch open threshold, power ratio
-    double close;     // squelch close threshold
+    double open;     // squelch open threshold, power ratio
+    double close;    // squelch close threshold
     int tail;        // Frames to hold open after loss of SNR
   } squelch;
 
@@ -247,17 +253,17 @@ struct channel {
   // Coherent bin bandwidth = block rate in Hz
   // Coherent bin spacing = block rate * 1 - ((M-1)/(L+M-1))
   struct {
-    double rbw;    // Requested bandwidth (hz) of noncoherent integration bin
-    double noise_bw;  // Estimated noise bandwidth of bin with current window
+    double rbw;       // Requested bandwidth (Hz) of noncoherent integration bin
+    double noise_bw;  // Estimated noise bandwidth (Hz) of bin with current window
     int bin_count;    // Requested bin count
     float *bin_data;  // Array of real floats with bin_count elements
-    double crossover;  // Crossover frequency between algorithms, Hz
+    double crossover; // Crossover frequency between algorithms, Hz
     double shape;     // Analysis window parameter if any (kaiser β, gaussian σ)
     int fft_n;        // size of analysis FFT
     int fft_avg;      // Number of consecutive FFTs to average into each spectrum response
     enum window_type window_type;
     float *window;    // Analysis window
-    void *plan;       // FFTW plan - don't drag in <fftw.h>
+    fftwf_plan plan;
     float complex *ring; // Ring buffer of demodulated data in narrowband mode
     int ring_size;
     int ring_idx;     // index into ring buffer
@@ -268,15 +274,13 @@ struct channel {
 
   // Output
   struct {
-    int samprate;      // Audio D/A sample rate
+    int samprate;         // Audio D/A sample rate
+    double headroom;      // Audio level headroom, amplitude ratio (settable)
+    bool silent;          // last packet was suppressed (used to generate RTP mark bit)
+    struct rtp_state rtp; // RTP network streaming
 
-    double headroom;    // Audio level headroom, amplitude ratio (settable)
-    // RTP network streaming
-    bool silent;       // last packet was suppressed (used to generate RTP mark bit)
-    struct rtp_state rtp;
-
-    struct sockaddr_storage source_socket;    // Source address of our data output
-    struct sockaddr_storage dest_socket;      // Dest of our data output (typically multicast)
+    struct sockaddr_storage source_socket;     // Source address of our data output
+    struct sockaddr_storage dest_socket;       // Dest of our data output (typically multicast)
     char dest_string[_POSIX_HOST_NAME_MAX+20]; // Allow room for :portnum
 
     int channels;   // 1 = mono, 2 = stereo (settable)
@@ -285,15 +289,15 @@ struct channel {
     double deemph_state_left;
     double deemph_state_right;
     uint64_t samples;
-    bool pacing;     // Pace output packets
+    bool pacing;           // Pace output packets
     enum encoding encoding;
-    float *queue;    // delayed output data for aggregation when minpacket > 0
-    int queue_length; // Size of allocation, in floats
-    int queue_age; // in frames
-    int maxdelay;  // maximum allowable extra latency for output aggregation in blocks, max 5
-    uint64_t errors;      // Count of errors with sendto()
-    double gain;        // Audio gain to normalize amplitude
-    int ttl; // per-channel IP TTL for multicast scope control
+    float *queue;          // delayed output data for aggregation when minpacket > 0
+    int queue_length;      // Size of allocation, in floats
+    int queue_age;         // in frames
+    int maxdelay;          // maximum allowable extra latency for output aggregation in blocks, max 5
+    uint64_t errors;       // Count of errors with sendto()
+    double gain;           // Audio gain to normalize amplitude
+    int ttl;               // per-channel IP TTL for multicast scope control
     uint32_t time_snap;    // Snapshot of RTP timestamp sampled by sender in status packets, for linking RTP time to clock time
   } output;
 
@@ -339,10 +343,11 @@ struct channel {
   uint64_t options;
   double tp1,tp2; // Spare test points that can be read on the status channel
 };
+typedef struct channel chan_t;
 
-
-extern struct channel Channel_list[];
-#define Nchannels 2000
+extern struct frontend Frontend;
+extern chan_t Channel_list[];
+extern chan_t Template;
 extern int Channel_idle_timeout;
 extern int Ctl_fd;     // File descriptor for receiving user commands
 extern int Output_fd,Output_fd0;
@@ -353,24 +358,30 @@ extern char const *Channel_keys[]; // Lists of valid keywords in config files
 extern double User_blocktime;
 extern double Blocktime;
 extern struct string_table opus_application[];
+extern pthread_mutex_t Channel_list_mutex;
+extern dictionary const *Preset_table;   // Table of presets, usually in /usr/local/share/ka9q-radio/presets.conf, never closed so can be const
+extern char Hostname[256]; // can't use sysconf(_SC_HOST_NAME_MAX) at file scope
+
 
 // Channel configuration, initialization & manipulation
 int loadconfig(char const *file);
-struct channel *create_chan(uint32_t ssrc);
-struct channel *lookup_chan(uint32_t ssrc);
-int close_chan(struct channel *);
-int set_defaults(struct channel *chan);
-int loadpreset(struct channel *chan,dictionary const *table,char const *preset);
-int start_demod(struct channel * restrict chan);
-double set_freq(struct channel * restrict ,double);
-double set_first_LO(struct channel const * restrict, double);
-void encode_byte_data(struct channel const *chan,uint8_t *buffer);
+chan_t *lookup_or_create_chan(uint32_t ssrc,chan_t const *chan);
+void set_defaults(void);
+int loadpreset(chan_t *chan,dictionary const *table,char const *preset);
+int start_demod(chan_t * restrict chan);
+double set_freq(chan_t * restrict ,double);
+double set_first_LO(chan_t const * restrict, double);
+void encode_byte_data(chan_t const *chan,uint8_t *buffer);
 
 // Routines common to the internals of all channel demods
 int compute_tuning(int N, int M, double samprate,int *shift,double *remainder, double freq);
-int downconvert(struct channel *chan);
-int set_channel_filter(struct channel *chan);
-void response(struct channel *chan,bool response_needed);
+int downconvert(chan_t *chan);
+int set_channel_filter(chan_t *chan);
+void response(chan_t *chan,bool response_needed);
+double estimate_noise(chan_t const *chan,int shift);// Noise estimator tuning
+
+void *sap_send(void *p);
+void *rtcp_send(void *p);
 
 // extract front end scaling factors (depends on width of A/D sample)
 double scale_voltage_out2FS(struct frontend *frontend);
@@ -380,18 +391,19 @@ double scale_ADpower2FS(struct frontend const *frontend);
 void *radio_status(void *);
 
 // Demodulator thread entry points
+int demod_idle(void *);
 int demod_fm(void *);
 int demod_wfm(void *);
 int demod_linear(void *);
 int demod_spectrum(void *);
 
 // Control and status
-int send_output(struct channel * restrict ,const float * ,int,bool);
-int send_radio_status(struct sockaddr const *,struct frontend const *, struct channel *);
-int reset_radio_status(struct channel *chan);
-bool decode_radio_commands(struct channel *chan,uint8_t const *buffer,unsigned long length);
-int decode_radio_status(struct frontend *frontend,struct channel *channel,uint8_t const *buffer,size_t length);
-int flush_output(struct channel *chan,bool marker,bool complete);
+int send_output(chan_t * restrict ,const float * ,int,bool);
+int send_radio_status(struct sockaddr const *,struct frontend const *, chan_t *);
+int reset_radio_status(chan_t *chan);
+bool decode_radio_commands(chan_t *chan,uint8_t const *buffer,int length);
+int decode_radio_status(struct frontend *frontend,chan_t *channel,uint8_t const *buffer,int length);
+int flush_output(chan_t *chan,bool marker,bool complete);
 
 
 unsigned int round_samprate(unsigned int x);

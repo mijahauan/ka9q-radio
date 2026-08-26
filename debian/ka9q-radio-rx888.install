@@ -6,11 +6,15 @@ usr/share/ka9q-radio/20s_watchdog.img
 usr/share/ka9q-radio/60s_watchdog.img
 usr/share/ka9q-radio/SDDC_FX3.img
 usr/share/ka9q-radio/W1EUJ_0.1.0_FX3.img
+usr/share/ka9q-radio/defaults/rx888.conf
+usr/share/ka9q-radio/defaults/04b4-00f1.conf
+usr/share/ka9q-radio/defaults/04b4-00f1-000908270a582911.conf
 usr/lib/systemd/system/rx888_boot.service
 usr/lib/udev/rules.d/70-rx888-boot.rules
 usr/lib/udev/rules.d/71-rx888.rules
-usr/lib/udev/rules.d/72-rx888-ka9q.rules
 etc/radio/rx888_bootfile.conf
+usr/share/ka9q-radio/defaults/rx888.conf
+usr/share/ka9q-radio/defaults/04b4-00f1.conf
 usr/share/ka9q-radio/examples/radiod@dp0gvn.conf.d
 usr/share/ka9q-radio/examples/radiod@kfs-nw.conf.d
 usr/share/ka9q-radio/examples/radiod@kfs-omni.conf.d

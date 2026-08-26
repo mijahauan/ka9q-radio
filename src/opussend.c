@@ -1,7 +1,6 @@
 // Multicast local audio with Opus
 // Copyright Feb 2018 Phil Karn, KA9Q
 // Probably no longer working; needs to be updated to emit status messages
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <math.h>
@@ -274,7 +273,6 @@ int main(int argc,char * const argv[]){
   // Graceful signal catch
   signal(SIGPIPE,closedown);
   signal(SIGINT,closedown);
-  signal(SIGKILL,closedown);
   signal(SIGQUIT,closedown);
   signal(SIGTERM,closedown);
   signal(SIGPIPE,SIG_IGN);

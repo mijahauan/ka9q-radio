@@ -1,6 +1,5 @@
 // read FFT bin energies from spectrum pseudo-demod and format similar to rtl_power - out of date
 // Copyright 2023 Phil Karn, KA9Q
-#define _GNU_SOURCE 1
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -30,18 +29,20 @@ uint32_t Ssrc;
 char Iface[1024]; // Multicast interface to talk to front end
 int Status_fd = -1;
 int64_t Timeout = BILLION; // Retransmission timeout
-bool details;   // Output bin, frequency, power, newline
+bool Details;   // Output bin, frequency, power, newline
 char const *Source;
 struct sockaddr_storage *Source_socket;
 
-static char const Optstring[] = "b:c:C:df:hi:o:s:t:T:vw:V";
+static char const Optstring[] = "a:b:c:C:df:hi:o:s:t:T:vw:V";
 static struct  option Options[] = {
+  {"average", required_argument, NULL, 'a'},
   {"bins", required_argument, NULL, 'b'},
   {"count", required_argument, NULL, 'c'},
   {"details", no_argument, NULL, 'd'},
   {"frequency", required_argument, NULL, 'f'},
   {"help", no_argument, NULL, 'h'},
   {"interval", required_argument, NULL, 'i'},
+  {"overlap", required_argument, NULL, 'O'},
   {"ssrc", required_argument, NULL, 's'},
   {"timeout", required_argument, NULL, 'T'},
   {"verbose", no_argument, NULL, 'v'},
@@ -53,10 +54,10 @@ static struct  option Options[] = {
 };
 
 
-int extract_powers(float *power,int npower,uint64_t *time,double *freq,double *rbw,int32_t const ssrc,uint8_t const * const buffer,size_t length);
+int extract_powers(float *power,int npower,uint64_t *time,double *freq,double *rbw,int *avg,int32_t const ssrc,uint8_t const * const buffer,size_t length);
 
 void help(){
-  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-f|--frequency freq] [-w|--bin-width rbw] [-b|--bins bins] [-c|--count count] [-i|--interval interval] [-T|--timeout timeout] [-d|--details] -s|--ssrc ssrc mcast_addr [-o|--source <source name-or-address>\n",App_path);
+  fprintf(stderr,"Usage: %s [-v|--verbose] [-V|--version] [-f|--frequency freq] [-w|--bin-width rbw] [-b|--bins bins] [-a|--average n] [-c|--count count] [-i|--interval interval] [-T|--timeout timeout] [-d|--details] -s|--ssrc ssrc mcast_addr [-o|--source <source name-or-address>\n",App_path);
   exit(1);
 }
 
@@ -66,32 +67,39 @@ int main(int argc,char *argv[]){
   double interval = 5; // Period between updates, sec
   double frequency = -1;
   int bins = 0;
+  int average = 1;
   double rbw = 0;
-  double crossover = -1;
+  // The default, but specify it explicitly. If rbw > crossover, use wideband mode. If rbw <= crossover, use narrowband
+  // this affects how averaging is done
+  double crossover = 200;
+  double overlap = 0;
   {
     int c;
     while((c = getopt_long(argc,argv,Optstring,Options,NULL)) != -1){
       switch(c){
+      case 'a':
+	average = abs(atoi(optarg));
+	break;
       case 'b':
-	bins = atoi(optarg);
+	bins = abs(atoi(optarg));
 	break;
       case 'c':
 	count = atoi(optarg);
 	break;
       case 'C':
-	crossover = strtod(optarg,NULL);
+	crossover = fabs(strtod(optarg,NULL));
 	break;
       case 'd':
-	details = true;
+	Details = true;
 	break;
       case 'f':
-	frequency = parse_frequency(optarg,true);
+	frequency = fabs(parse_frequency(optarg,true));
 	break;
       case 'h':
 	help();
 	break;
       case 'i':
-	interval = strtod(optarg,NULL);
+	interval = fabs(strtod(optarg,NULL));
 	break;
       case 's':
 	Ssrc = atoi(optarg); // Send to specific SSRC
@@ -103,7 +111,7 @@ int main(int argc,char *argv[]){
 	Verbose++;
 	break;
       case 'w':
-	rbw = strtod(optarg,NULL);
+	rbw = fabs(strtod(optarg,NULL));
 	break;
       case 'V':
 	VERSION();
@@ -122,6 +130,20 @@ int main(int argc,char *argv[]){
     help();
 
   Target = argv[optind];
+  if(Ssrc == 0){
+    Ssrc = random() & 0xffffffff;
+    if(Ssrc == 0 || Ssrc == 0xffffffff) // reserved
+      Ssrc = 12345678; // unlikely
+  }
+  bool const wideband = rbw > crossover ? true : false;
+  double averaging_time = average / rbw; // total time span required; forget overlap for now
+  int piece_average = average;
+  int pieces = 1;
+  if(wideband && averaging_time > 0.08){
+    // Wideband averaging is limited to A/D data in the ring buffer, usually 80 ms. Parameterize this?
+    piece_average = (int)floor(0.08 * rbw);
+    pieces = average/piece_average;
+  }
   resolve_mcast(Target,&Metadata_dest_socket,DEFAULT_STAT_PORT,Iface,sizeof(Iface),0);
   if(Verbose)
     fprintf(stderr,"Resolved %s -> %s\n",Target,formatsock(&Metadata_dest_socket,false));
@@ -133,7 +155,6 @@ int main(int argc,char *argv[]){
       fprintf(stdout,"Resolving source %s\n",Source);
     resolve_mcast(Source,Source_socket,0,NULL,0,0);
   }
-
   Status_fd = listen_mcast(Source_socket,&Metadata_dest_socket,Iface);
   if(Status_fd == -1){
     fprintf(stderr,"Can't listen to mcast status %s\n",Target);
@@ -144,85 +165,112 @@ int main(int argc,char *argv[]){
     fprintf(stderr,"connect to mcast control failed: %s\n",strerror(errno));
     exit(1);
   }
-
   // Send command to set up the channel?? Or do in a separate command? We'd like to reuse the same demod & ssrc,
   // which is hard to do in one command, as we'd have to stash the ssrc somewhere.
   while(true){
-    uint8_t buffer[PKTSIZE];
-    uint8_t *bp = buffer;
-    *bp++ = 1; // Command
-
-    encode_int(&bp,OUTPUT_SSRC,Ssrc);
-    uint32_t tag = (uint32_t)random();
-    encode_int(&bp,COMMAND_TAG,tag);
-    encode_int(&bp,DEMOD_TYPE,SPECT_DEMOD);
-    if(frequency >= 0)
-      encode_double(&bp,RADIO_FREQUENCY,frequency); // 0 frequency means terminate
-    if(bins > 0)
-      encode_int(&bp,BIN_COUNT,bins);
-    if(rbw > 0)
-      encode_float(&bp,RESOLUTION_BW,rbw);
-    if(crossover >= 0)
-      encode_float(&bp,CROSSOVER,crossover);
-    encode_eol(&bp);
-    ssize_t const command_len = bp - buffer;
-    if(Verbose > 1){
-      fprintf(stderr,"Sent:");
-      dump_metadata(stderr,buffer+1,command_len-1,details ? true : false);
-    }
-    socklen_t const slen = Metadata_dest_socket.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-    if(sendto(Ctl_fd, buffer, command_len, 0, (struct sockaddr *)&Metadata_dest_socket, slen) != command_len){
-      perror("command send");
-      usleep(10000); // 10 millisec
-      goto again;
-    }
-    // The deadline starts at 1 sec after a command
-    int64_t deadline = gps_time_ns() + Timeout;
-    ssize_t length = 0;
-    do {
-      // Wait for a reply to our query
-      // ignore all packets on group without changing deadline
-      fd_set fdset;
-      FD_ZERO(&fdset);
-      FD_SET(Status_fd,&fdset);
-      int n = Status_fd + 1;
-      int64_t timeout = deadline - gps_time_ns();
-      // Immediate poll if timeout is negative
-      if(timeout < 0)
-	timeout = 0;
-      struct timespec ts;
-      ns2ts(&ts,timeout);
-      n = pselect(n,&fdset,NULL,NULL,&ts,NULL);
-      if(n <= 0 && timeout == 0){
-	usleep(10000); // rate limit, just in case
-	goto again;
-      }
-      if(!FD_ISSET(Status_fd,&fdset))
-	continue;
-      // Read message on the multicast group
-      socklen_t ssize = sizeof(Metadata_source_socket);
-      length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&Metadata_source_socket,&ssize);
-
-      // Ignore invalid packets, non-status packets, packets re other SSRCs and packets not in response to our polls
-      // Should we insist on the same command tag, or accept any "recent" status packet, e.g., triggered by the control program?
-      // This is needed because an initial delay in joining multicast groups produces a burst of buffered responses; investigate this
-    } while(length < 2 || (enum pkt_type)buffer[0] != STATUS || Ssrc != get_ssrc(buffer+1,length-1) || tag != get_tag(buffer+1,length-1));
-
-    if(Verbose > 1){
-      fprintf(stderr,"Received:");
-      dump_metadata(stderr,buffer+1,length-1,details ? true : false);
-    }
     float powers[PKTSIZE / sizeof(float)]; // floats in a max size IP packet
     uint64_t time;
     double r_freq;
     double r_rbw;
+    int r_avg;
+    size_t npower = 0;
+    int tot_avg =0;
 
-    size_t npower = extract_powers(powers,sizeof(powers) / sizeof (powers[0]), &time,&r_freq,&r_rbw,Ssrc,buffer+1,length-1);
-    if(npower <= 0){
-      fprintf(stderr,"Invalid response, length %llu\n",(long long unsigned)npower);
-      usleep(10000); // 10 millisec
-      continue; // Invalid for some reason; retry
+    memset(powers,0,sizeof powers); // Reset for a new averaging
+    while(tot_avg < average){
+      // Iterate however many times are needed to get the averaging we need
+      uint8_t buffer[PKTSIZE];
+      uint8_t *bp = buffer;
+      *bp++ = 1; // Command
+
+      encode_int(&bp,OUTPUT_SSRC,Ssrc);
+      uint32_t tag = (uint32_t)random();
+      encode_int(&bp,COMMAND_TAG,tag);
+      encode_int(&bp,DEMOD_TYPE,SPECT_DEMOD);
+      encode_int(&bp,LIFETIME,interval * 2 * 50); // twice the polling interval
+      if(frequency >= 0)
+	encode_double(&bp,RADIO_FREQUENCY,frequency); // 0 frequency means terminate
+      if(bins > 0)
+	encode_int(&bp,BIN_COUNT,bins);
+      if(rbw > 0)
+	encode_float(&bp,RESOLUTION_BW,rbw);
+      if(crossover >= 0)
+	encode_float(&bp,CROSSOVER,crossover);
+      encode_int(&bp,SPECTRUM_AVG,average);
+      encode_float(&bp,SPECTRUM_OVERLAP,overlap);
+      encode_eol(&bp);
+      ssize_t const command_len = bp - buffer;
+      if(Verbose > 1){
+	fprintf(stderr,"Sent:");
+	dump_metadata(stderr,buffer+1,command_len-1,Details);
+      }
+      socklen_t const slen = Metadata_dest_socket.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+      if(sendto(Ctl_fd, buffer, command_len, 0, (struct sockaddr *)&Metadata_dest_socket, slen) != command_len){
+	perror("command send");
+	usleep(10000); // 10 millisec
+	goto again;
+      }
+      // The deadline starts at 1 sec after a command
+      int64_t send_time = gps_time_ns();
+      int64_t deadline = send_time + Timeout;
+
+      ssize_t length = 0;
+      do {
+	// Wait for a reply to our query
+	// ignore all other packets on group without changing deadline
+	fd_set fdset;
+	FD_ZERO(&fdset);
+	FD_SET(Status_fd,&fdset);
+	int n = Status_fd + 1;
+	int64_t timeout = deadline - gps_time_ns();
+	// Immediate poll if timeout is negative
+	if(timeout < 0)
+	  timeout = 0;
+	struct timespec ts;
+	ns2ts(&ts,timeout);
+	n = pselect(n,&fdset,NULL,NULL,&ts,NULL);
+	if(n <= 0 && timeout == 0)
+	  goto again; // no response before timeout
+	if(!FD_ISSET(Status_fd,&fdset))
+	  continue; // Keep listening until we get a packet
+
+	// Read message on the multicast group
+	socklen_t ssize = sizeof(Metadata_source_socket);
+	length = recvfrom(Status_fd,buffer,sizeof(buffer),0,(struct sockaddr *)&Metadata_source_socket,&ssize);
+
+	// Ignore invalid packets, non-status packets, packets re other SSRCs and packets not in response to our polls
+	// Should we insist on the same command tag, or accept any "recent" status packet, e.g., triggered by the control program?
+	// This is needed because an initial delay in joining multicast groups produces a burst of buffered responses; investigate this
+      } while(length < 2 || (enum pkt_type)buffer[0] != STATUS || Ssrc != get_ssrc(buffer+1,length-1) || tag != get_tag(buffer+1,length-1));
+
+      if(Verbose > 1){
+	fprintf(stderr,"Received:");
+	dump_metadata(stderr,buffer+1,length-1,Details);
+      }
+      float power_tmp[PKTSIZE / sizeof(float)]; // floats in a max size IP packet
+      npower = extract_powers(power_tmp,sizeof powers / sizeof powers[0], &time,&r_freq,&r_rbw,&r_avg,Ssrc,buffer+1,length-1);
+      if(npower <= 0){
+	usleep(10000); // 10 millisec
+	continue; // probably doesn't contain bin data yet
+      }
+      for(unsigned i=0; i < npower; i++){
+	float p = power_tmp[i];
+	if(isfinite(p))
+	  powers[i] += p;
+      }
+      tot_avg += r_avg; // Number of FFTs actually averaged
+
+      // Wait for fresh A/D data
+      int64_t timeout = send_time - gps_time_ns() + BILLION * (int64_t)r_avg / rbw;
+      if(timeout > 0)
+	usleep(timeout/1000);
+    again:;
     }
+    // Normalize
+    float scale = 1.f / pieces;
+    for(unsigned i=0; i < npower; i++)
+      powers[i] *= scale;
+
     // Note from VK5QI:
     // the output format from that utility matches that produced by rtl_power, which is:
     //2022-04-02, 16:24:55, 400050181, 401524819, 450.13, 296, -52.95, -53.27, -53.26, -53.24, -53.40, <many more points here>
@@ -254,40 +302,40 @@ int main(int argc,char *argv[]){
     }
     double const min_db = lowest != INFINITY ? power2dB(lowest) : 0;
 
-    if (details){
+    if (Details){
       // Frequencies below center
       printf("\n");
       for(size_t i=first_neg_bin ; i < npower; i++){
-        printf("%llu %lf %.2lf\n",(long long unsigned)i,base,(powers[i] == 0) ? min_db : power2dB(powers[i]));
-        base += r_rbw;
+	printf("%llu %lf %.2lf\n",(long long unsigned)i,base,(powers[i] == 0) ? min_db : power2dB(powers[i]));
+	base += r_rbw;
       }
       // Frequencies above center
       for(size_t i=0; i < first_neg_bin; i++){
-        printf("%llu %lf %.2lf\n",(long long unsigned)i,base,(powers[i] == 0) ? min_db : power2dB(powers[i]));
-        base += r_rbw;
+	printf("%llu %lf %.2lf\n",(long long unsigned)i,base,(powers[i] == 0) ? min_db : power2dB(powers[i]));
+	base += r_rbw;
       }
     } else {
       for(size_t i= first_neg_bin; i < npower; i++)
-        printf(", %.2lf",(powers[i] == 0) ? min_db : power2dB(powers[i]));
+	printf(", %.2lf",(powers[i] == 0) ? min_db : power2dB(powers[i]));
       // Frequencies above center
       for(size_t i=0; i < first_neg_bin; i++)
-        printf(", %.2lf",(powers[i] == 0) ? min_db : power2dB(powers[i]));
+	printf(", %.2lf",(powers[i] == 0) ? min_db : power2dB(powers[i]));
     }
     printf("\n");
     if(--count == 0)
       break;
 
+
     // need to add randomized wait and avoidance of poll if response elicited by other poller (eg., control) comes in first
     // And if we decide to use those responses (currently blocked by command tag check)
     usleep((useconds_t)(interval * 1e6));
-  again:;
   }
   exit(0);
 }
 
 // Decode only those status fields relevant to spectrum measurement
 // Return number of bins
-int extract_powers(float *power,int npower,uint64_t *time,double *freq,double *rbw,int32_t const ssrc,uint8_t const * const buffer,size_t length){
+int extract_powers(float *power,int npower,uint64_t *time,double *freq,double *rbw,int32_t *avg,int32_t const ssrc,uint8_t const * const buffer,size_t length){
 #if 0  // use later
   double l_lo1 = 0,l_lo2 = 0;
 #endif
@@ -357,6 +405,9 @@ int extract_powers(float *power,int npower,uint64_t *time,double *freq,double *r
       break;
     case BIN_COUNT: // Do we check that this equals the length of the BIN_DATA tlv?
       l_ccount = decode_int(cp,optlen);
+      break;
+    case SPECTRUM_AVG:
+      *avg = decode_int(cp,optlen);
       break;
     default:
       break;

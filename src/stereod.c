@@ -3,7 +3,6 @@
 // to a stereo signal @ 48 kHz
 // Part of ka9q-radio. This is a standalone daemon, an alternative to the (very similar) built-in decoder
 // Copyright 2020-2023 Phil Karn, KA9Q
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <complex.h>
@@ -30,6 +29,8 @@
 #include "filter.h"
 #include "iir.h"
 #include "avahi.h"
+#include "sched.h"
+#include "defaults.h"
 
 #define BUFFERSIZE 16384  // Tune this
 
@@ -215,7 +216,7 @@ int main(int argc,char * const argv[]){
 
   signal(SIGPIPE,SIG_IGN);
 
-  realtime(default_prio());
+  realtime(DEFAULT_PRIO);
 
   // Set up to receive PCM in RTP/UDP/IP
   // Process incoming RTP packets, demux to per-SSRC thread
@@ -384,20 +385,20 @@ void *decode(void *arg){
 
   // Baseband filters, decimate from 384 Khz to 48 KHz
   struct filter_out mono;
-  create_filter_output(&mono,&baseband,NULL,audio_L, REAL);
+  create_filter_output(&mono,&baseband,audio_L, REAL);
   // 50 Hz to 15 kHz
   set_filter(&mono,50.0/Audio_samprate, 15000.0/Audio_samprate, Kaiser_beta);
 
   // Narrow filter at 19 kHz for stereo pilot
   struct filter_out pilot;
-  create_filter_output(&pilot,&baseband,NULL,audio_L, COMPLEX);
+  create_filter_output(&pilot,&baseband,audio_L, COMPLEX);
   // FCC says +/- 2 Hz, with +/- 20 Hz protected (73.322)
   set_filter(&pilot,-100./Audio_samprate, 100./Audio_samprate, Kaiser_beta);
 
   // Stereo difference (L-R) information on DSBSC carrier at 38 kHz
   // Extends +/- 15 kHz around 38 kHz
   struct filter_out stereo;
-  create_filter_output(&stereo,&baseband,NULL,audio_L, COMPLEX);
+  create_filter_output(&stereo,&baseband,audio_L, COMPLEX);
   set_filter(&stereo,-15000./Audio_samprate, 15000./Audio_samprate, Kaiser_beta);
 
   // Assume the remainder is zero, as it is for clean sample rates @ 200 Hz multiples

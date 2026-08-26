@@ -1,7 +1,5 @@
 // Interactive program to tune radiod in ka9q-radio
 // Copyright 2023 Phil Karn, KA9Q
-
-#define _GNU_SOURCE 1
 #include <stdio.h>
 #include <assert.h>
 
@@ -264,9 +262,9 @@ int main(int argc,char *argv[]){
       uint8_t *bp = cmd_buffer;
       *bp++ = 1; // Generate command packet
       sent_tag = arc4random();
-      encode_int(&bp,COMMAND_TAG,sent_tag);
-      encode_int(&bp,OUTPUT_SSRC,Ssrc);
-      encode_int(&bp,LIFETIME,Lifetime);
+      encode_int32(&bp,COMMAND_TAG,sent_tag);
+      encode_int32(&bp,OUTPUT_SSRC,Ssrc);
+      encode_int32(&bp,LIFETIME,Lifetime);
 
       if(Mode != NULL)
 	encode_string(&bp,PRESET,Mode,strlen(Mode));
@@ -312,7 +310,7 @@ int main(int argc,char *argv[]){
       encode_eol(&bp);
       ssize_t cmd_len = bp - cmd_buffer;
       socklen_t const slen = Control_address.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-      if(sendto(Control_sock, cmd_buffer, cmd_len, 0,(struct sockaddr *)&Control_address, slen))
+      if(sendto(Control_sock, cmd_buffer, cmd_len, 0,(struct sockaddr *)&Control_address, slen) == -1)
 	perror("command send");
 
       last_command_time = gps_time_ns();

@@ -1,8 +1,6 @@
 // Obsolete - use 'tune' program
 // Interactive program to set predetection filters
 // Copyright 2023 Phil Karn, KA9Q
-
-#define _GNU_SOURCE 1
 #include <stdio.h>
 #include <assert.h>
 #include <stdlib.h>
@@ -168,7 +166,7 @@ int main(int argc,char *argv[]){
       }
       cp += optlen;
     }
-    if(isnan(low) || isnan(high))
+    if(!isfinite(low) || !isfinite(high))
       continue; // Didn't get what we wanted
     // If we sent a command, wait for its acknowledgement
     // Otherwise, just display the current frequency

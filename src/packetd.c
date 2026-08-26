@@ -3,7 +3,6 @@
 // Copyright 2018, Phil Karn, KA9Q
 // NEEDS TO BE REWRITTEN to use channel status stream to get sample rate and format
 
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
@@ -493,7 +492,7 @@ static void *decode_task(void *arg){
   struct filter_in filter_in = {0};
   create_filter_input(&filter_in,AL,AM,REAL);
   struct filter_out filter_out;
-  create_filter_output(&filter_out,&filter_in,NULL,AL,COMPLEX);
+  create_filter_output(&filter_out,&filter_in,AL,COMPLEX);
   const double filter_low = min(mark_tone,space_tone) - Bitrate/4;
   const double filter_high = max(mark_tone,space_tone) + Bitrate/4;
   set_filter(&filter_out,filter_low/sp->samprate,filter_high/sp->samprate,3.0); // Creates analytic, band-limited signal

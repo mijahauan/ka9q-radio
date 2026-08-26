@@ -1,11 +1,11 @@
 // funcube driver module linked into radiod
 // Copyright July 2023, Phil Karn,  KA9Q
-#define _GNU_SOURCE 1
 
 #include <pthread.h>
 #include <portaudio.h>
 #include <errno.h>
 #include <iniparser/iniparser.h>
+#include <string.h>
 #if defined(linux)
 #include <bsd/string.h>
 #endif
@@ -18,6 +18,8 @@
 #include "misc.h"
 #include "config.h"
 #include "radio.h"
+#include "sched.h"
+#include "defaults.h"
 
 // constants, some of which you might want to tweak
 static double const AGC_upper = -15;
@@ -87,7 +89,7 @@ static void do_fcd_agc(struct sdrstate *);
 static double fcd_actual(unsigned int);
 double funcube_tune(struct frontend * const frontend,double const freq);
 
-int funcube_setup(struct frontend * const frontend, dictionary * const dictionary, char const * const section){
+int funcube_setup(struct frontend * const frontend, dictionary const * const dictionary, char const * const section){
   assert(dictionary != NULL);
   {
     char const * const device = config_getstring(dictionary,section,"device",section);
@@ -209,8 +211,6 @@ static void *proc_funcube(void *arg){
   int ConsecPaErrs = 0;
   int16_t * sampbuf = malloc(2 * blocksize * sizeof(*sampbuf)); // complex samples have two integers
 
-  realtime(2 + default_prio());
-
   int r = Pa_StartStream(sdr->Pa_Stream);
   if(r < 0){
     fprintf(stderr,"Pa_StartStream error: %s\n",Pa_GetErrorText(r));
@@ -289,7 +289,7 @@ static void *proc_funcube(void *arg){
     write_cfilter(&frontend->in,NULL,blocksize); // Update write pointer, invoke FFT
     frontend->samples += blocksize;
     double const block_energy = i_energy + q_energy; // Normalize for complex pairs
-    if(!isnan(block_energy) && isfinite(block_energy))
+    if(isfinite(block_energy))
       frontend->if_power += Power_alpha * (block_energy / blocksize - frontend->if_power); // Average A/D output power per channel
 
     // Update every block

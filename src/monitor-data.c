@@ -2,7 +2,6 @@
 // Moved out of monitor.c when it was getting way too big
 // Copyright Aug 2024 Phil Karn, KA9Q
 
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
@@ -34,6 +33,8 @@
 #include "status.h"
 #include "monitor.h"
 #include "import.h"
+#include "sched.h"
+#include "defaults.h"
 
 int Position; // auto-position streams
 
@@ -47,17 +48,16 @@ double PL_tones[] = {
     237.1, 241.8, 245.5, 250.3, 254.1
 };
 static double make_position(int x);
-static void init_pl(struct session *sp);
-static int run_pl(struct session *sp);
-static void apply_notch(struct session *sp);
-static int conceal(struct session *sp,int gap);
-static int decode_rtp_data(struct session *sp,struct packet const *pkt);
-static void copy_to_stream(struct session *sp);
-static int upsample(struct session *sp);
-static uint64_t reset_playout(struct session *sp);
+static void init_pl(sess_t *sp);
+static int run_pl(sess_t *sp);
+static void apply_notch(sess_t *sp);
+static int conceal(sess_t *sp,int gap);
+static int decode_rtp_data(sess_t *sp,struct packet const *pkt);
+static void copy_to_stream(sess_t *sp);
+static int upsample(sess_t *sp);
+static uint64_t reset_playout(sess_t *sp);
 static void *decode_task(void *arg);
 static int calculate_deadline(struct timespec *deadline,int64_t timeout);
-static int calculate_tight_deadline(struct timespec *deadline,struct session *sp);
 
 // Receive from data multicast streams, multiplex to decoder threads
 void *dataproc(void *arg){
@@ -81,7 +81,7 @@ void *dataproc(void *arg){
 
   struct packet *pkt = NULL;
 
-  realtime(default_prio());
+  realtime(DEFAULT_PRIO);
   // Main loop begins here
   while(!atomic_load_explicit(&Terminate,memory_order_acquire)){
     // Need a new packet buffer?
@@ -118,7 +118,7 @@ void *dataproc(void *arg){
 
     kick_output(); // Ensure output thread is running
     // Find appropriate session; create new one if necessary
-    struct session *sp = lookup_or_create_session(&sender,pkt->rtp.ssrc);
+    sess_t *sp = lookup_or_create_session(&sender,pkt->rtp.ssrc);
     if(!sp){
       fprintf(stderr,"No room!!\n");
       continue;
@@ -145,23 +145,12 @@ void *dataproc(void *arg){
     struct packet *qe = NULL;
 
     int qlen = 0;
-    const int maxq = 100; // 2 seconds
     pthread_mutex_lock(&sp->qmutex);
     for(qe = sp->queue;
-	qe != NULL && qlen < maxq && pkt->rtp.seq >= qe->rtp.seq;
+	qe != NULL && pkt->rtp.seq >= qe->rtp.seq;
 	q_prev = qe,qe = qe->next,qlen++)
       ;
 
-    if(qlen >= maxq){
-      // Queue has gotten out of control, blow it away. Seems to happen when a macos laptop is asleep
-      struct packet *qnext;
-      for(qe = sp->queue; qe != NULL; qe = qnext){
-	qnext = qe->next;
-	FREE(qe);
-      }
-      q_prev = NULL;
-      // queue now empty, can put new packet at head
-    }
     if(qe)
       sp->reseqs++;   // Not the last on the list
     pkt->next = qe;
@@ -178,7 +167,7 @@ void *dataproc(void *arg){
   return NULL;
 }
 static void decode_task_cleanup(void *arg){
-  struct session *sp = (struct session *)arg;
+  sess_t *sp = (sess_t *)arg;
   assert(sp);
 
   atomic_store_explicit(&sp->inuse,false,memory_order_release);
@@ -203,7 +192,7 @@ static void decode_task_cleanup(void *arg){
   sp->src_state_mono = NULL;
 
   // Just in case anything was allocated for these arrays
-  struct channel * const chan = &sp->chan;
+  chan_t * const chan = &sp->chan;
   FREE(chan->spectrum.bin_data);
   for(int i=0; i < CQLEN; i++){
     FREE(chan->commands[i].buffer);
@@ -221,7 +210,7 @@ static void decode_task_cleanup(void *arg){
 // Per-session thread to decode incoming RTP packets
 // Not needed for PCM, but Opus can be slow
 static void *decode_task(void *arg){
-  struct session * const sp = (struct session *)arg;
+  sess_t * const sp = (sess_t *)arg;
   assert(sp);
   {
     char name[100];
@@ -231,7 +220,6 @@ static void *decode_task(void *arg){
   pthread_cleanup_push(decode_task_cleanup,arg); // called on termination
   if(sp->buffer == NULL)
     sp->buffer = malloc(BUFFERSIZE * sizeof *sp->buffer);
-
 
   struct packet *pkt = NULL; // make sure it starts this way
 
@@ -245,141 +233,139 @@ static void *decode_task(void *arg){
   sp->playout = lrint(Playout * (double)DAC_samprate); // per-session playout is in frames
   atomic_store_explicit(&sp->muted,Start_muted,memory_order_release);
   sp->restart = true; // Force rest of init when first packet arrives
-  struct timespec deadline = {0};
-  // Main outer loop; run until inner loop senses a terminate
-  while(true){
+  // Main loop; run until inner loop senses a terminate
+  while(!terminated(sp)){
     if(gps_time_ns() > sp->last_active + BILLION/2){
       sp->active = 0; // no data for 500 ms. could probably also close squelch
       sp->squelch_open = false;
     }
-    if(!sp->squelch_open || sp->samprate == 0 || sp->channels == 0){
+    enum encoding const encoding = sp->pt_table[sp->type].encoding;
+    if(!sp->squelch_open || sp->samprate == 0 || sp->channels == 0)
       sp->plc_enable = false;
-    } else {
-      enum encoding encoding = sp->pt_table[sp->type].encoding;
+    else
       sp->plc_enable = (encoding == OPUS || encoding == OPUS_VOIP);
-    }
-    if(sp->plc_enable){
-      // If we can send PLCs, sleep until the last millisecond to do them
-      // compute max wait time for a new packet or a squelch state change
-      calculate_tight_deadline(&deadline,sp);
-    } else
-      calculate_deadline(&deadline,10*BILLION);
 
-    assert(pkt == NULL); // watch for leaks
-
-    while(!terminated(sp)){ // inner loop until we get a packet to process
-      // Wait until the deadline for an RTP packet
-      assert(pkt == NULL); // should be cleared, otherwise it's a memory leak
-      pthread_mutex_lock(&sp->qmutex);
-      int rc = 0;
-      do {
-	pkt = sp->queue;
-	if(pkt != NULL && (sp->restart || (int16_t)(pkt->rtp.seq - sp->next_seq)<=0))
-	  break;	  // No reason to wait
-
-	// The qcond condition is signaled when a new RTP frame appears
+    // Try to get another in-sequence packet
+    assert(pkt == NULL); // should be cleared, otherwise it's a memory leak
+    int seq_diff = 0;
+    int rc = 0;
+    pthread_mutex_lock(&sp->qmutex);
+    while(rc != ETIMEDOUT){
+      pkt = sp->queue;
+      if(pkt == NULL){
+	// Nothing in queue, just wait for another packet
+	// The queue might run dry but we can't help it
+	// Use a 1 second timeout just to let sp->active get reset on an idle session
 	Waits++;
-	rc = pthread_cond_timedwait(&sp->qcond,&sp->qmutex,&deadline);
+	if(sp->active != 0){
+	  struct timespec timeout = {0};
+	  calculate_deadline(&timeout, BILLION);
+	  rc = pthread_cond_timedwait(&sp->qcond,&sp->qmutex,&timeout);
+	} else {
+	  rc = pthread_cond_wait(&sp->qcond,&sp->qmutex); // idle session; wait indefinitely
+	}
 	rc &= 0xff;
-	assert(rc == 0 || rc == ETIMEDOUT); // shouldn't fail for any other reason
-      } while(rc != ETIMEDOUT);
-      if(rc == ETIMEDOUT)
-	Wait_timeout++;
-      else
-	Wait_successful++;
-
-      if(pkt != NULL)
-	sp->queue = pkt->next; // before we release the lock
-      pthread_mutex_unlock(&sp->qmutex); // no longer examining queue
-
-      if(rc == 0){
-	// poison the deadline to try to force an error if I reuse it by mistake
-	deadline.tv_sec = -1;
-	deadline.tv_nsec = 2 * BILLION;
+	continue;
       }
-      if(pkt != NULL){
-	if(sp->restart){
-	  sp->restart = false;
-	  sp->next_seq = pkt->rtp.seq;
-	  sp->next_timestamp = pkt->rtp.timestamp;
-	  pkt->next = NULL;
-	  reset_playout(sp);
-	}
-	if((int16_t)(pkt->rtp.seq - sp->next_seq) > 10){
-	  // Allow a forward sequence jump of up to 10 dropped packets
-	  // Accept old sequence numbers to get them out of the way, they're probably too old anyway
-	  // But if it persists, consider a possible stream restart
-	  if(++sp->consec_out_of_order < 6){
-	    // Toss but count
-	    sp->drops++;
-	    FREE(pkt);
-	    continue; // repeat inner loop with the SAME deadline
-	  }
-	  reset_playout(sp);
-	  sp->next_timestamp = pkt->rtp.timestamp;
-	} else if(pkt->rtp.marker){
-	  reset_playout(sp);
-	  sp->next_timestamp = pkt->rtp.timestamp;
-	}
-	sp->next_seq = pkt->rtp.seq + 1; // Expect the one after this next
-	sp->last_timestamp = pkt->rtp.timestamp; // remember the latest for delay calcs
-	sp->consec_erasures = 0;
-	sp->consec_out_of_order = 0;
-	decode_rtp_data(sp,pkt); // will pick up sp->samprate the first time
+      // an RTP packet is on the queue
+      seq_diff = (int16_t)(pkt->rtp.seq - sp->next_seq);
+      int64_t const q = qlen(sp);
+      if(seq_diff <= 0 // if it's the expected sequence or an old one
+	 || sp->restart // if we're restarting
+	 || (encoding != OPUS && encoding != OPUS_VOIP) // or if it's Opus
+	 || q <= 0) // or the playout buffer has run dry
+	break; // process it now regardless of sequence
+      // seq_diff > 0: sequence gap - we're missing a packet
+      // and Opus sequence numbers can't go backward because the decoder is stateful
+      // So wait until just before the queue runs dry to see if the one we want shows up
+      Gap_waits++;
+      struct timespec deadline = {0};
+      calculate_deadline(&deadline,BILLION * q / DAC_samprate);
+      rc = pthread_cond_timedwait(&sp->qcond,&sp->qmutex,&deadline);
+      rc &= 0xff;
+      assert(rc == 0 || rc == ETIMEDOUT); // shouldn't fail for any other reason
+    } // end of wait loop
+    if(pkt != NULL)
+      sp->queue = pkt->next; // remove from queue before we release the lock
+    pthread_mutex_unlock(&sp->qmutex); // no longer examining queue
+    if(rc == ETIMEDOUT)
+      Wait_timeout++;
 
-	// decoded data is in sp->bounce. where do we write it?
-	// remember the sender's timestamp and our read pointer both increase steadily with real time
-	int32_t jump = (int32_t)(pkt->rtp.timestamp - sp->next_timestamp);
-
-	// convert to frames at DAC rate
-	if(jump != 0){
-	  if(sp->samprate == 0 || sp->channels == 0){
-	    // Can't proceed, probably first use of a new payload type
-	    FREE(pkt);
-	    sp->drops++;
-	    reset_playout(sp); // but don't fall behind for when it clears up
-	    continue;
-	  }
-	  int write_adjust = (int64_t)jump * DAC_samprate / sp->samprate;
-	  if(write_adjust != 0){
-	    atomic_fetch_add_explicit(&sp->wptr,write_adjust,memory_order_release);	    // Adjust write pointer
-	    uint64_t wptr = atomic_load_explicit(&sp->wptr,memory_order_relaxed);
-	    if(wptr > sp->wptr_highwater)
-	      sp->wptr_highwater = wptr;
-	  }
-	}
-	sp->next_timestamp = pkt->rtp.timestamp + sp->frame_size;
+    if(pkt != NULL){
+      pkt->next = NULL;
+      if(sp->restart || (seq_diff < 0 && ++sp->consec_out_of_order >= 6)){
+	// We're restarting, or it's a burst of old packets, assume it's a resynch
+	sp->next_timestamp = pkt->rtp.timestamp;
+	reset_playout(sp);
+	sp->restart = false;
+	// reset opus decoder?
+      } else if(seq_diff > 0){
+	// Give up on the one we want, jump into the future
+	sp->drops += (int16_t)seq_diff;
+	sp->next_timestamp = pkt->rtp.timestamp;
+	// reset opus decoder?
+      } else if(seq_diff < 0 && (encoding == OPUS || encoding == OPUS_VOIP)){
+	// Opus can't handle old packets because it's stateful. Just drop
+	sp->drops++;
 	FREE(pkt);
-	break; // data in sp->bounce, length in sp->frame_size, process in outer loop, recalculate timeout on next pass
+	continue;
       }
-      // else timeout. pkt == NULL; nothing usable on queue
+      if(pkt->rtp.marker){
+	sp->next_timestamp = pkt->rtp.timestamp;
+	reset_playout(sp);
+      }
+      sp->next_seq = pkt->rtp.seq + 1; // Expect the one after this next
+      sp->last_timestamp = pkt->rtp.timestamp; // remember the latest for delay calcs
+      sp->consec_erasures = 0;
+      sp->consec_out_of_order = 0;
+      decode_rtp_data(sp,pkt); // will pick up sp->samprate the first time
+
+      // decoded data is in sp->bounce. where do we write it?
+      // remember the sender's timestamp and our read pointer both increase steadily with real time
+      int32_t const jump = (int32_t)(pkt->rtp.timestamp - sp->next_timestamp);
+
+      // convert to frames at DAC rate
+      if(jump != 0){
+	if(sp->samprate == 0 || sp->channels == 0){
+	  // Can't proceed, probably first use of a new payload type
+	  FREE(pkt);
+	  sp->drops++;
+	  reset_playout(sp); // but don't fall behind for when it clears up
+	  continue;
+	}
+	int const write_adjust = (int64_t)jump * DAC_samprate / sp->samprate;
+	if(write_adjust != 0){
+	  atomic_fetch_add_explicit(&sp->wptr,write_adjust,memory_order_release);	    // Adjust write pointer
+	}
+      }
+      sp->next_timestamp = pkt->rtp.timestamp + sp->frame_size;
+      FREE(pkt);
+    } else { // timeout, pkt == NULL, no packet
+      sp->frame_size = 0;
       if(sp->squelch_open && sp->plc_enable){
 	// Look at our send queue to decide whether to issue a PLC
 	// wptr and rptr are in stereo frames at DAC_samprate, typically 48 kHz
-	int64_t q = qlen(sp);
+	int64_t const q = qlen(sp);
 	// Read and write pointers and sample rate  must be initialized to be useful
 	// Look for less than 10 ms of margin. Probably actually a multiple of 20 ms
-	if(q <= DAC_samprate/100 && sp->last_framesize != 0 && sp->consec_erasures++ < 6){
-	  int n;
-	  if((n = conceal(sp,sp->last_framesize)) > 0){
-	    // Attempted packet conceal succeeded
-	    sp->frame_size = n;
-	    sp->next_seq++; // assume we've lost one, expect the next. If the lost one arrives late it will be dropped
-	    sp->next_timestamp += sp->frame_size; // sp->framesize is returned by conceal()
-	    break; // process the synthetic PLC samples in sp->bounce, recalulate timeout
-	  }
-	}
-      }	// we've run dry but can't send a PLC
-      sp->frame_size = 0;
-      break; // no progress, let outer loop recalculate our deadline
-    }// end of inner loop
-    if(terminated(sp))
-      goto done;
+	if(q > DAC_samprate/100 || sp->last_framesize == 0 || sp->consec_erasures++ >= 6)
+	  continue; // do nothing
+	int const n = conceal(sp,sp->last_framesize);
+	if(n <= 0)
+	  continue; // failed to conceal
+
+	// Attempted packet conceal succeeded
+	sp->frame_size = n;
+	sp->next_seq++; // assume we've lost one, expect the next. If the lost one arrives late it will be dropped
+	sp->next_timestamp += sp->frame_size; // sp->framesize is returned by conceal()
+	// fall through, process the synthetic PLC samples in sp->bounce
+      }
+    }
     // We have a frame of decoded audio or PLC from Opus
     // Do PL detection and notching even when muted
     if(sp->frame_size > 0 && sp->samprate != 0){
       // Limit to 1.5s on queue
-      int64_t q = qlen(sp);
+      int64_t const q = qlen(sp);
       if(q < 0 || q > 3 * DAC_samprate / 2)
 	reset_playout(sp);
 
@@ -394,22 +380,19 @@ static void *decode_task(void *arg){
       upsample(sp);
       copy_to_stream(sp);
     }
-  } // end of outer loop
- done:;
+  }
   pthread_cleanup_pop(1);
   return NULL;
 }
 
 // Reset playout buffer
 // also reset Opus decoder, if present
-static uint64_t reset_playout(struct session * const sp){
+static uint64_t reset_playout(sess_t * const sp){
   sp->resets++;
   if(sp->opus)
     opus_decoder_ctl(sp->opus,OPUS_RESET_STATE); // Reset decoder
 
   uint64_t const wptr = sp->playout + atomic_load_explicit(&Output_time,memory_order_relaxed);
-  if(wptr > sp->wptr_highwater)
-    sp->wptr_highwater = wptr;
   atomic_store_explicit(&sp->wptr,wptr,memory_order_release);
   return wptr;
 }
@@ -467,7 +450,7 @@ static double make_position(int x){
 // Decode opus or just convert PCM
 // Returns number of bytes written into bounce buffer, which may be 0
 // caller may then free packet
-static int decode_rtp_data(struct session *sp,struct packet const *pkt){
+static int decode_rtp_data(sess_t *sp,struct packet const *pkt){
   assert(sp != NULL && pkt != NULL);
   if(sp == NULL || pkt == NULL)
     return 0;
@@ -511,7 +494,7 @@ static int decode_rtp_data(struct session *sp,struct packet const *pkt){
 
   // This section processes the signal in the current RTP frame, copying and/or decoding it into a sp->bounce buffer
   // for mixing with the output ring buffer
-  enum encoding encoding = sp->pt_table[sp->type].encoding;
+  enum encoding const encoding = sp->pt_table[sp->type].encoding;
   switch(encoding){
   case OPUS:
   case OPUS_VOIP:
@@ -617,7 +600,7 @@ static int decode_rtp_data(struct session *sp,struct packet const *pkt){
 // Called when there isn't an in-sequence packet to be processed
 // Takes length to be concealed at DAC samprate, must br legal opus
 // returns length of generated plc
-static int conceal(struct session *sp,int gap){
+static int conceal(sess_t *sp,int gap){
   assert(sp != NULL);
   if(sp == NULL)
     return 0;
@@ -636,7 +619,7 @@ static int conceal(struct session *sp,int gap){
   return frame_count; // how much we moved, even if not opus
 }
 
-static int run_pl(struct session *sp){
+static int run_pl(sess_t *sp){
   assert(sp != NULL);
   if(sp == NULL)
     return -1;
@@ -690,7 +673,7 @@ static int run_pl(struct session *sp){
   return 0;
 } // End of PL tone decoding
 
-static void init_pl(struct session *sp){
+static void init_pl(sess_t *sp){
   assert(sp != NULL);
   if(sp == NULL)
     return;
@@ -700,7 +683,7 @@ static void init_pl(struct session *sp){
     init_goertzel(&sp->tone_detector[j],PL_tones[j]/(double)sp->samprate);
   sp->notch_tone = 0;
 }
-static void apply_notch(struct session *sp){
+static void apply_notch(sess_t *sp){
   assert(sp != NULL);
   if(sp == NULL)
     return;
@@ -720,7 +703,7 @@ static void apply_notch(struct session *sp){
   }
 }
 // Upsample to DAC rate if necessary
-static int upsample(struct session * const sp){
+static int upsample(sess_t * const sp){
   assert(sp != NULL && sp->samprate != 0 && sp->channels != 0);
   if(sp == NULL || sp->samprate == 0 || sp->channels == 0)
     return -1;
@@ -772,7 +755,7 @@ static int upsample(struct session * const sp){
 
 // Copy from bounce buffer to streaming output buffer read by Portaudio callback
 // ASSUMES sp->bounce has DAC_samprate
-static void copy_to_stream(struct session *sp){
+static void copy_to_stream(sess_t *sp){
   assert(sp != NULL);
   if(sp == NULL)
     return;
@@ -793,16 +776,15 @@ static void copy_to_stream(struct session *sp){
     if (sp->channels == 1)
       energy *= 2; // +3dB for mono because of 0 dBFS definition for mono being peak, not rms
 #if 0
-    if(!isnan(energy) && isfinite(energy))
+    if(isfinite(energy))
       sp->level += .1 * (energy - sp->level); // smooth
 #else
-    if(!isnan(energy) && isfinite(energy))
+    if(isfinite(energy))
       sp->level = energy;
 #endif
   }
   {
-    int64_t q = qlen(sp);
-
+    int64_t const q = qlen(sp);
     // Use these for playout buffer adjustments
     if(q < 0){
       sp->lates++;
@@ -828,7 +810,7 @@ static void copy_to_stream(struct session *sp){
     goto advance; // skip the copy
 
   // Mix output sample rate data into output ring buffer
-  int base = (wptr * Channels) & (BUFFERSIZE-1); // Base of output buffer for this packet
+  int const base = (wptr * Channels) & (BUFFERSIZE-1); // Base of output buffer for this packet
 
   if(Channels == 2){
     /* Compute gains and delays for stereo imaging
@@ -857,7 +839,7 @@ static void copy_to_stream(struct session *sp){
     if(sp->channels == 1){
       for(int i=0; i < sp->frame_size; i++){
 	// Mono input, put on both channels
-	double s = sp->bounce[i];
+	double const s = sp->bounce[i];
 	sp->buffer[BINDEX(base,left_index)] = (float)(s * left_gain);
 	sp->buffer[BINDEX(base,right_index)] = (float)(s * right_gain);
 	left_index += Channels;
@@ -866,8 +848,8 @@ static void copy_to_stream(struct session *sp){
     } else {
       for(int i=0; i < sp->frame_size; i++){
 	// stereo input
-	double left = sp->bounce[2*i];
-	double right = sp->bounce[2*i+1];
+	double const left = sp->bounce[2*i];
+	double const right = sp->bounce[2*i+1];
 	sp->buffer[BINDEX(base,left_index)] = left * left_gain;
 	sp->buffer[BINDEX(base,right_index)] = right * right_gain;
 	left_index += Channels;
@@ -877,14 +859,12 @@ static void copy_to_stream(struct session *sp){
   } else { // Channels == 1, no panning
     if(sp->channels == 1){
       for(int i=0; i < sp->frame_size; i++){
-	double s = sp->gain * sp->bounce[i];
-	sp->buffer[BINDEX(base,i)] = (float)s;
+	sp->buffer[BINDEX(base,i)] = sp->gain * sp->bounce[i];
       }
     } else {  // sp->channels == 2
       for(int i=0; i < sp->frame_size; i++){
 	// Downmix to mono
-	double s = 0.5 * sp->gain * (sp->bounce[2*i] + sp->bounce[2*i+1]);
-	sp->buffer[BINDEX(base,i)] = (float)s;
+	sp->buffer[BINDEX(base,i)] = 0.5 * sp->gain * (sp->bounce[2*i] + sp->bounce[2*i+1]);
       }
     }
   } // if(sp->channels == 1)
@@ -894,8 +874,6 @@ static void copy_to_stream(struct session *sp){
   wptr += sp->frame_size;
   // Write back atomically
   atomic_store_explicit(&sp->wptr,wptr,memory_order_release);
-  if(wptr > sp->wptr_highwater)
-    sp->wptr_highwater = wptr;
 }
 static int calculate_deadline(struct timespec *deadline,int64_t timeout){
   assert(deadline != NULL);
@@ -913,16 +891,8 @@ static int calculate_deadline(struct timespec *deadline,int64_t timeout){
   }
   return 0;
 }
-// calculate deadline for when active queue will dry up
-static int calculate_tight_deadline(struct timespec *deadline,struct session *sp){
-  int64_t frames = qlen(sp);
-  if(frames <= 0)
-    return calculate_deadline(deadline,0); // from now
-
-  return calculate_deadline(deadline,BILLION * frames / DAC_samprate);
-}
 // Frames @ DAC rate still to be played out
-int64_t qlen(struct session const *sp){
+int64_t qlen(sess_t const *sp){
   uint64_t const rptr = atomic_load_explicit(&Output_time,memory_order_acquire); // the callback writes it
   uint64_t const wptr = atomic_load_explicit(&sp->wptr,memory_order_relaxed); // only we write it
   if(rptr == 0 || wptr == 0)
