@@ -28,7 +28,9 @@
 #include "iir.h"
 #include "window.h"
 #include "pilot.h"
-#include "tick.h"
+struct tick_state;   // tick.h (HamSCI)
+struct tick_second;
+struct tick_feed;
 
 char const *demod_name_from_type(enum demod_type type);
 int demod_type_from_name(char const *name);
@@ -341,8 +343,8 @@ struct channel {
   struct {
     unsigned templates;          // preset "ticks": mask of 1 << enum tick_template; 0 = off
     struct tick_state *det;
-    struct tick_feed *feed;      // naming seconds and epochs, private to tick_chan.c
-    struct tick_second last;     // latest report; positions on the channel-output counter
+    struct tick_feed *feed;      // naming seconds and epochs (tick_feed.h)
+    struct tick_second *last;    // latest report (heap, with det); positions on the channel-output counter
     bool last_valid;
     uint64_t last_epoch;         // INPUT_EPOCH of the block that completed it
     int64_t last_second_utc_ns;  // the UTC second it measured, ns since the GPS epoch

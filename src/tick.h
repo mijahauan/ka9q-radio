@@ -57,6 +57,10 @@ int tick_process(struct tick_state *t, float complex const *s, int n, int64_t fi
 // complete = false. The stream itself stays contiguous; queued seconds stay queued
 void tick_break(struct tick_state *t, int64_t index);
 
+// Turn a report into an incomplete one: complete = false, measurements zero,
+// peak_index NaN; the positions (second_index, window_start_index, step, nprofile) stay
+void tick_second_incomplete(struct tick_second *out);
+
 char const *tick_template_name(enum tick_template k); // "wwv", "wwvh", "bpm"
 // Samples past the nominal second a report needs before it can complete
 int tick_span_end(struct tick_state const *t);

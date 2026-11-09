@@ -11,6 +11,7 @@
 #include <stdatomic.h>
 #include <complex.h>
 #include "tick.h"
+#include "pilot.h"
 
 // Channel-output counter of UTC second utc_second_ns, given a reference pair:
 // channel-output index ref_index holds UTC ref_utc_ns. Rounded to the nearest sample
@@ -31,6 +32,11 @@ struct tick_ref {
 // The latest locked pilot report of this radiod, as a reference pair. One
 // writer at a time (writers spin on wlock for a few stores), any number of
 // readers, none of which ever waits: a seqlock whose fields are all atomic
+// The reference a pilot report gives: its raw edge, which runs late by the
+// pilot channel's filter delay, less that delay. False (nothing written) for
+// a report that is not valid and locked
+bool tick_ref_from_pilot(struct pilot_report const *r, double in_samprate, struct tick_ref *ref);
+
 struct tick_pilot_slot {
   atomic_flag wlock;
   _Atomic uint64_t seq;    // odd while being written; 0 = never written
@@ -65,7 +71,7 @@ struct tick_feed {
   // each report finds the UTC second and the reference that named it
   bool have_named;
   int64_t last_named;
-  struct { int64_t second_index, utc_ns; bool used_pilot; } named[TICK_FEED_NAMED];
+  struct { int64_t second_index, utc_ns; uint64_t epoch; bool used_pilot; } named[TICK_FEED_NAMED];
   int next_named;
 };
 struct tick_meta {         // what the glue knows about one report beside struct tick_second

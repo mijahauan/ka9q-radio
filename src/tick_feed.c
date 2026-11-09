@@ -20,8 +20,11 @@
 // (pilot_filter_delay_s() in pilot_chan.c). The pilot's raw edge runs late by
 // the pilot channel's own delay, so whoever builds a pilot reference first
 // takes that delay off the edge (tick_pilot_publish in tick_chan.c) to get the
-// input position where the UTC second entered; the host-clock reference pairs
-// gps_time_ns() with the input sample count, which no filter has touched. Here
+// input position where the UTC second entered (tick_ref_from_pilot); the
+// host-clock reference pairs gps_time_ns() with the input sample count, which
+// no filter has touched. That count reaches the host after USB and callback
+// latency, so the host reference names UTC slightly late and windows open
+// early by that latency (a few ms, inside the 10 ms lead). Here
 // the tick channel's own delay goes back on. With both delays the same, as on
 // channels built alike, they cancel. This only moves the window, which needs
 // millisecond accuracy (the ticks sit 0-50 ms inside a 70 ms window). Every
@@ -32,8 +35,14 @@
 // Epochs. The output counter follows radiod's input counter, which counts
 // every sample that arrives and never goes back, so it does not rebase on a
 // new epoch; instead tick_break makes every report whose span began before the
-// epoch's first block come out incomplete. A block that straddles a loss stays
-// out of the core, and the next block then arrives as a gap.
+// epoch's first block come out incomplete. A loss also moves UTC against the
+// counter by the lost time, so a second named (about a second ahead) on the
+// old epoch's mapping also reports incomplete when a block of a later epoch
+// completes it, even if its span began after the loss; the core's
+// half-second rule keeps it from being renamed. A loss near half a second or
+// more can leave the next second on the new mapping too close to the old
+// name to be kept, and that second goes unreported. A block that straddles a
+// loss stays out of the core, and the next block then arrives as a gap.
 //
 // Copyright 2026, HamSCI
 #include <ctype.h>
@@ -72,6 +81,17 @@ unsigned tick_parse_templates(char const *s){
       return mask;
     s += len + 1;
   }
+}
+
+bool tick_ref_from_pilot(struct pilot_report const *r,double in_samprate,struct tick_ref *ref){
+  if(r == NULL || ref == NULL || !r->valid || !r->locked)
+    return false;
+  // Window placement only (ms accuracy); the frac and the delay model never
+  // touch a reported position
+  ref->input_pos = (double)r->edge_input_sample + r->edge_input_frac - r->filter_delay_s * in_samprate;
+  ref->utc_ns = r->edge_utc_ns;
+  ref->epoch = r->epoch;
+  return true;
 }
 
 void tick_slot_publish(struct tick_pilot_slot *s,struct tick_ref const *r){
@@ -172,6 +192,7 @@ int tick_feed_block(struct tick_state *t,struct tick_feed *f,float complex const
     f->named[f->next_named].second_index = second_index;
     f->named[f->next_named].utc_ns = second_ns;
     f->named[f->next_named].used_pilot = ref_is_pilot;
+    f->named[f->next_named].epoch = epoch;
     f->next_named = (f->next_named + 1) % TICK_FEED_NAMED;
     f->have_named = true;
     f->last_named = second_index;
@@ -182,12 +203,20 @@ int tick_feed_block(struct tick_state *t,struct tick_feed *f,float complex const
   meta->second_utc_ns = 0;
   meta->used_pilot = false;
   meta->epoch = epoch;
+  bool found = false;
   for(int i=0; i < TICK_FEED_NAMED; i++){
     if(f->named[i].second_index == out->second_index && f->named[i].utc_ns != 0){
       meta->second_utc_ns = f->named[i].utc_ns;
       meta->used_pilot = f->named[i].used_pilot;
+      // Named on another epoch's mapping: a loss shifted UTC against the
+      // counter by the lost time, so this window sits on the old mapping
+      if(f->named[i].epoch != epoch)
+        tick_second_incomplete(out);
+      found = true;
       break;
     }
   }
+  if(!found)
+    tick_second_incomplete(out); // can't say what second it measured
   return 1;
 }

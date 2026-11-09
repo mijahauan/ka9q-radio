@@ -12,6 +12,7 @@
 #include <time.h>
 #include "tick.h"
 #include "tick_feed.h"
+#include "pilot.h"
 
 #define SR 24000
 #define BATCH 480
@@ -302,6 +303,8 @@ struct feed_opts {
   int pilot_from_block;   // from this block on, the reference counts as the pilot's (-1: never)
   int64_t pilot_shift_ns; // the pilot reference's own error
   double delay_out;       // tick channel filter delay, output samples
+  int64_t loss_ns;        // UTC lost at the epoch change: the input counter stays
+                          // contiguous, so from epoch 2 on the reference names UTC this much later
 };
 static struct tick_meta Meta[MAXREP];
 
@@ -324,7 +327,7 @@ static int run_feed(struct synth const *sy,unsigned mask,int seconds,struct feed
     // The UTC second at output index S0 enters at input BASE_IN + DECIM*S0
     struct tick_ref const ref = {
       .input_pos = (double)(BASE_IN + DECIM * (int64_t)S0),
-      .utc_ns = UTC0 + (pilot ? o->pilot_shift_ns : o->ref_shift_ns),
+      .utc_ns = UTC0 + (pilot ? o->pilot_shift_ns : o->ref_shift_ns) + (epoch == 2 ? o->loss_ns : 0),
       .epoch = epoch,
     };
     struct tick_second r;
@@ -395,10 +398,55 @@ static void test_window_spanning_epoch_is_flagged(void){
     assert(Rep[1].complete && Meta[1].epoch == 1);
     assert(Rep[2].second_index == S0 + 2 * SR);
     assert(!Rep[2].complete && isnan(Rep[2].peak_index[TICK_WWV]));
-    assert(Rep[3].complete && Meta[3].epoch == 2);
+    // Second 3 was named (at S0 + 2 SR - 10 ms) in epoch 1 and completes in epoch 2
+    assert(Rep[3].second_index == S0 + 3 * SR);
+    assert(!Rep[3].complete && isnan(Rep[3].peak_index[TICK_WWV]) && Meta[3].epoch == 2);
     assert(Rep[4].complete && Meta[4].epoch == 2);
   }
   printf("test_window_spanning_epoch_is_flagged passed\n");
+}
+
+// A loss keeps the input counter contiguous while UTC jumps by the lost time:
+// a second named on the old mapping must not report complete on new data,
+// and the next second follows the new mapping
+static void test_loss_moves_the_mapping(void){
+  struct synth sy = { .tick_ms = {3.0,0}, .tick_amp = {0.5,0}, .noise_rms = 0.01, .first_som = 10 };
+  int const blk = (int)((S0 + 2 * SR) / BATCH) + 1;
+  int64_t const L = 300000000; // 300 ms lost
+  struct feed_opts const o = { .epoch_block = blk, .pilot_from_block = -1, .loss_ns = L };
+  Rng = 4;
+  int const n = run_feed(&sy,1u << TICK_WWV,6,&o);
+  assert(n >= 5);
+  for(int i=0; i < 5; i++)
+    printf("  second %d: index %lld complete %d epoch %llu utc +%lld ms\n",i,(long long)Rep[i].second_index,
+           Rep[i].complete,(unsigned long long)Meta[i].epoch,(long long)((Meta[i].second_utc_ns - UTC0) / 1000000));
+  int64_t const shift = L / 1000000 * SR / 1000; // 7200 samples
+  assert(Rep[3].second_index == S0 + 3 * SR);   // named on the old mapping
+  assert(!Rep[3].complete && isnan(Rep[3].peak_index[TICK_WWV]));
+  assert(Rep[4].second_index == S0 + 4 * SR - shift);
+  assert(Meta[4].second_utc_ns == UTC0 + 4000000000LL && Meta[4].epoch == 2);
+  assert(Rep[4].complete);
+  printf("test_loss_moves_the_mapping passed\n");
+}
+
+// The pilot's raw edge runs late by the pilot channel's filter delay: the
+// reference takes it off
+static void test_ref_from_pilot(void){
+  struct pilot_report r = { .valid = true, .locked = true, .epoch = 9,
+                            .edge_input_sample = 1000000000LL, .edge_input_frac = 0.25,
+                            .edge_utc_ns = UTC0, .filter_delay_s = 0.0025 };
+  double const in = 64.8e6;
+  struct tick_ref ref;
+  assert(tick_ref_from_pilot(&r,in,&ref));
+  printf("  edge %lld + 0.25, delay 2.5 ms -> input_pos %.2f\n",(long long)r.edge_input_sample,ref.input_pos);
+  assert(fabs(ref.input_pos - (1000000000.25 - 162000)) < 1e-3);
+  assert(ref.utc_ns == UTC0 && ref.epoch == 9);
+  r.locked = false;
+  assert(!tick_ref_from_pilot(&r,in,&ref));
+  r.locked = true;
+  r.valid = false;
+  assert(!tick_ref_from_pilot(&r,in,&ref));
+  printf("test_ref_from_pilot passed\n");
 }
 
 // A pilot reference arriving mid-run: the second already named on the host
@@ -478,6 +526,8 @@ int main(void){
   test_coarse_nominal_second();
   test_window_spanning_epoch_is_flagged();
   test_used_pilot_follows_the_named_second();
+  test_loss_moves_the_mapping();
+  test_ref_from_pilot();
   test_pilot_slot();
   test_report_cost();
   printf("all tick tests passed\n");

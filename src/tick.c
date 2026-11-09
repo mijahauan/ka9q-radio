@@ -329,6 +329,18 @@ static void do_envelope(struct tick_state const *t,struct tick_second *out){
   }
 }
 
+void tick_second_incomplete(struct tick_second *out){
+  out->complete = false;
+  memset(out->profile,0,sizeof(out->profile));
+  for(int k=0; k < TICK_NTEMPLATES; k++){
+    out->peak_index[k] = NAN;
+    out->peak_snr_db[k] = 0;
+  }
+  memset(out->marker_energy,0,sizeof(out->marker_energy));
+  memset(out->envelope,0,sizeof(out->envelope));
+  out->envelope_scale = 0;
+}
+
 static void make_report(struct tick_state *t,int64_t second,struct tick_second *out){
   int64_t const begin = second + t->span_begin;
   out->second_index = second;
@@ -338,14 +350,7 @@ static void make_report(struct tick_state *t,int64_t second,struct tick_second *
   out->complete = begin >= t->valid_from && begin >= t->end - t->ringsize
     && second + t->span_end <= t->end;
   if(!out->complete){
-    memset(out->profile,0,sizeof(out->profile));
-    for(int k=0; k < TICK_NTEMPLATES; k++){
-      out->peak_index[k] = NAN;
-      out->peak_snr_db[k] = 0;
-    }
-    memset(out->marker_energy,0,sizeof(out->marker_energy));
-    memset(out->envelope,0,sizeof(out->envelope));
-    out->envelope_scale = 0;
+    tick_second_incomplete(out);
     return;
   }
   // Linear copy of the span, and its magnitude

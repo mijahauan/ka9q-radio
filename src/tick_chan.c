@@ -32,18 +32,9 @@
 static struct tick_pilot_slot Pilot_slot = TICK_PILOT_SLOT_INIT;
 
 void tick_pilot_publish(struct pilot_report const * const r,double const in_samprate){
-  if(r == NULL || !r->valid || !r->locked)
-    return;
-  // The raw edge runs late by the pilot channel's filter delay; take it off to
-  // get the input position where the named UTC second entered radiod. Only
-  // window placement uses this (ms accuracy); the frac and the delay model
-  // never touch a reported position
-  struct tick_ref const ref = {
-    .input_pos = (double)r->edge_input_sample + r->edge_input_frac - r->filter_delay_s * in_samprate,
-    .utc_ns = r->edge_utc_ns,
-    .epoch = r->epoch,
-  };
-  tick_slot_publish(&Pilot_slot,&ref);
+  struct tick_ref ref;
+  if(tick_ref_from_pilot(r,in_samprate,&ref)) // valid and locked only
+    tick_slot_publish(&Pilot_slot,&ref);
 }
 
 // Set up the detector on the first block. False = can't run; the caller turns
@@ -68,7 +59,10 @@ static bool tick_chan_start(chan_t * const chan){
     return false;
   }
   struct tick_feed * const feed = calloc(1,sizeof(*feed));
-  if(feed == NULL){
+  struct tick_second * const last = calloc(1,sizeof(*last)); // ~27 KB: off chan_t
+  if(feed == NULL || last == NULL){
+    free(feed);
+    free(last);
     tick_destroy(det);
     return false;
   }
@@ -76,6 +70,7 @@ static bool tick_chan_start(chan_t * const chan){
   tick_feed_init(feed,(int)ratio,frontend->samprate,samprate,delay_out);
   chan->ticks.det = det;
   chan->ticks.feed = feed;
+  chan->ticks.last = last;
   chan->ticks.decim = (int)ratio;
   chan->ticks.last_valid = false;
   fprintf(stderr,"%s ticks: on; templates%s%s%s, decimation %d, filter delay %.1f samples\n",chan->name,
@@ -89,8 +84,10 @@ static bool tick_chan_start(chan_t * const chan){
 void tick_chan_stop(chan_t * const chan){
   tick_destroy(chan->ticks.det);
   free(chan->ticks.feed);
+  free(chan->ticks.last);
   chan->ticks.det = NULL;
   chan->ticks.feed = NULL;
+  chan->ticks.last = NULL;
   chan->ticks.last_valid = false;
 }
 
@@ -109,15 +106,16 @@ void tick_on_block(chan_t * const chan,bool const straddle){
   bool const pilot = tick_slot_read(&Pilot_slot,&ref) && tick_ref_fresh(&ref,epoch,index,frontend->samprate);
   if(!pilot){
     // The host clock now, paired with the input samples counted at that moment
-    // (as pilot_on_block names the pilot's second); USB and scheduling latency
-    // of a few ms stay in it, inside what window placement needs
+    // (as pilot_on_block names the pilot's second). USB and callback latency
+    // make it name UTC slightly late, so windows open early by a few ms,
+    // inside the window's 10 ms lead
     ref.input_pos = (double)frontend->samples;
     ref.utc_ns = gps_time_ns();
     ref.epoch = epoch;
   }
   struct tick_meta meta;
   int const r = tick_feed_block(chan->ticks.det,chan->ticks.feed,chan->baseband,chan->sampcount,
-				index,epoch,straddle,&ref,pilot,&chan->ticks.last,&meta);
+				index,epoch,straddle,&ref,pilot,chan->ticks.last,&meta);
   if(r != 1)
     return;
   chan->ticks.last_valid = true;
