@@ -29,14 +29,14 @@ struct tick_ref {
   uint64_t epoch;          // the input epoch input_pos belongs to
 };
 
-// The latest locked pilot report of this radiod, as a reference pair. One
-// writer at a time (writers spin on wlock for a few stores), any number of
-// readers, none of which ever waits: a seqlock whose fields are all atomic
 // The reference a pilot report gives: its raw edge, which runs late by the
 // pilot channel's filter delay, less that delay. False (nothing written) for
 // a report that is not valid and locked
 bool tick_ref_from_pilot(struct pilot_report const *r, double in_samprate, struct tick_ref *ref);
 
+// The latest locked pilot report of this radiod, as a reference pair. One
+// writer at a time (writers spin on wlock for a few stores), any number of
+// readers, none of which ever waits: a seqlock whose fields are all atomic
 struct tick_pilot_slot {
   atomic_flag wlock;
   _Atomic uint64_t seq;    // odd while being written; 0 = never written

@@ -13,6 +13,7 @@
 #include "tick.h"
 #include "tick_feed.h"
 #include "pilot.h"
+#include "tick_status.h"
 
 #define SR 24000
 #define BATCH 480
@@ -209,15 +210,15 @@ static void test_envelope_rate(void){
     assert(r->complete && r->envelope_scale > 0);
     double mean = 0;
     double complex bin = 0, off = 0;
-    for(int k=0; k < TICK_ENVELOPE; k++){
+    for(int k=0; k < TICK_ENVELOPE_LEN; k++){
       double const e = r->envelope[k] * (double)r->envelope_scale;
       mean += e;
       bin += e * cexp(-I*2*M_PI*100*k/1000.0);
       off += e * cexp(-I*2*M_PI*150*k/1000.0);
     }
-    mean /= TICK_ENVELOPE;
-    double const amp = 2 * cabs(bin) / TICK_ENVELOPE;
-    double const amp150 = 2 * cabs(off) / TICK_ENVELOPE;
+    mean /= TICK_ENVELOPE_LEN;
+    double const amp = 2 * cabs(bin) / TICK_ENVELOPE_LEN;
+    double const amp150 = 2 * cabs(off) / TICK_ENVELOPE_LEN;
     printf("  second %d: mean %.5f, 100 Hz amplitude %.5f (150 Hz %.2g)\n",i,mean,amp,amp150);
     assert(fabs(mean - 1) < 0.02);
     assert(fabs(amp - 0.5) <= 0.02 * 0.5);
@@ -514,6 +515,96 @@ static void test_report_cost(void){
   printf("test_report_cost passed\n");
 }
 
+// A filled report through encode_tick_status and decode_tick_status: every
+// field comes back, and the packet stays inside what one datagram holds
+static void test_tick_tlv_roundtrip(void){
+  struct tick_second *s = calloc(1,sizeof(*s));
+  struct tick_status *d = calloc(1,sizeof(*d));
+  assert(s != NULL && d != NULL);
+  int const decim = 2560;      // 64.8 MHz / 24 kHz is 2700; any integer exercises the arithmetic
+  int64_t const base = 123456789012LL;
+  s->second_index = 5000000; s->window_start_index = 5000000 - 240; s->step = 2; s->nprofile = 840;
+  for(int k=0; k < TICK_NTEMPLATES; k++){
+    for(int i=0; i < s->nprofile; i++)
+      s->profile[k][i] = (float)(37.5 * (k+1) * sin(0.01*i)) + I * (float)(-12.25 * cos(0.02*i*(k+1)));
+    s->peak_index[k] = s->window_start_index + 100.25 + 7 * k;
+    s->peak_snr_db[k] = 20.5f + k;
+  }
+  for(int m=0; m < TICK_MARKER_TONES; m++)
+    s->marker_energy[m] = 0.125 * (m+1);
+  for(int i=0; i < TICK_ENVELOPE_LEN; i++)
+    s->envelope[i] = (int16_t)(i * 31 - 15000);
+  s->envelope_scale = 0.00042f;
+  s->complete = true;
+  uint8_t pkt[16384];
+  uint8_t *bp = pkt;
+  encode_tick_status(&bp,s,1700000000000000000LL,true,7,base,decim);
+  size_t const len = bp - pkt;
+  printf("  tick group %zu bytes (three profiles of %d, envelope)\n",len,s->nprofile);
+  assert(len < 13000); // ~12.2 KB: over the 9 KB hoped for, since three 840-value int16 pairs are 10 KB alone; PKTSIZE is 64 KB
+
+  uint8_t const *cp = pkt;
+  while(cp < bp){
+    int const type = *cp++;
+    int optlen = *cp++;
+    if(optlen & 0x80){
+      int const n = optlen & 0x7f;
+      optlen = 0;
+      for(int i=0; i < n; i++)
+        optlen = (optlen << 8) | *cp++;
+    }
+    assert(decode_tick_status(d,(enum status_type)type,cp,optlen));
+    cp += optlen;
+  }
+  assert(d->valid && d->second_utc_ns == 1700000000000000000LL);
+  assert(d->window_start_input == base + (int64_t)s->window_start_index * decim);
+  assert(d->step_input == 2 * decim);
+  assert(d->complete && d->used_pilot && d->templates == 7);
+  for(int k=0; k < TICK_NTEMPLATES; k++){
+    assert(d->nprofile[k] == 840);
+    float const tol = d->profile_scale[k] / 32767.0f * 1.01f;
+    for(int i=0; i < 840; i++){
+      assert(fabsf(crealf(d->profile[k][i]) - crealf(s->profile[k][i])) <= tol);
+      assert(fabsf(cimagf(d->profile[k][i]) - cimagf(s->profile[k][i])) <= tol);
+    }
+    assert(d->have_peaks);
+    assert(d->peak_offset[k] == (float)((100.25 + 7 * k) * decim));
+    assert(d->peak_snr_db[k] == (float)s->peak_snr_db[k]);
+  }
+  assert(d->have_markers);
+  for(int m=0; m < TICK_MARKER_TONES; m++)
+    assert(d->marker_energy[m] == (float)s->marker_energy[m]);
+  assert(d->nenvelope == TICK_ENVELOPE_LEN && d->envelope_scale == s->envelope_scale);
+  for(int i=0; i < TICK_ENVELOPE_LEN; i++)
+    assert(d->envelope[i] == s->envelope[i]);
+
+  // An incomplete report: zeros, NaN peaks, bit0 clear, still delivered
+  tick_second_incomplete(s);
+  s->complete = false;
+  bp = pkt;
+  encode_tick_status(&bp,s,1700000001000000000LL,false,1u << TICK_WWV,base,decim);
+  memset(d,0,sizeof(*d));
+  cp = pkt;
+  while(cp < bp){
+    int const type = *cp++;
+    int optlen = *cp++;
+    if(optlen & 0x80){
+      int const n = optlen & 0x7f;
+      optlen = 0;
+      for(int i=0; i < n; i++)
+        optlen = (optlen << 8) | *cp++;
+    }
+    assert(decode_tick_status(d,(enum status_type)type,cp,optlen));
+    cp += optlen;
+  }
+  assert(d->valid && !d->complete && !d->used_pilot && d->templates == 1);
+  assert(d->nprofile[TICK_WWV] == 840 && d->nprofile[TICK_WWVH] == 0);
+  assert(maxmag(d->profile[TICK_WWV],840) == 0);
+  assert(d->have_peaks && isnan(d->peak_offset[TICK_WWV]) && isnan(d->peak_offset[TICK_WWVH]));
+  free(s); free(d);
+  printf("test_tick_tlv_roundtrip passed\n");
+}
+
 int main(void){
   test_two_stations_separate();
   test_absent_station_reported();
@@ -530,6 +621,7 @@ int main(void){
   test_ref_from_pilot();
   test_pilot_slot();
   test_report_cost();
+  test_tick_tlv_roundtrip();
   printf("all tick tests passed\n");
   exit(0);
 }

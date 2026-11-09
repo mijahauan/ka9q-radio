@@ -39,8 +39,8 @@
 // counter by the lost time, so a second named (about a second ahead) on the
 // old epoch's mapping also reports incomplete when a block of a later epoch
 // completes it, even if its span began after the loss; the core's
-// half-second rule keeps it from being renamed. A loss near half a second or
-// more can leave the next second on the new mapping too close to the old
+// half-second rule keeps it from being renamed. A loss whose L mod 1 s is greater
+// than about 0.5 s can leave the next second on the new mapping too close to the old
 // name to be kept, and that second goes unreported. A block that straddles a
 // loss stays out of the core, and the next block then arrives as a gap.
 //

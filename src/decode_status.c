@@ -397,6 +397,17 @@ int decode_radio_status(struct frontend *frontend,chan_t *chan,uint8_t const *bu
         chan->pilot.last.epoch = ps.epoch;
       }
       break;
+    case TICK_SECOND_UTC:
+    case TICK_WINDOW_START:
+    case TICK_STEP:
+    case TICK_FLAGS:
+    case TICK_PROFILE_WWV:
+    case TICK_PROFILE_WWVH:
+    case TICK_PROFILE_BPM:
+    case TICK_PEAKS:
+    case TICK_MARKERS:
+    case TICK_ENVELOPE:
+      break; // the control program keeps no tick state; clients use decode_tick_status (tick_status.c)
     case IQ_IMBALANCE:
       frontend->gain_error = decode_float(cp,optlen);
       break;

@@ -13,8 +13,8 @@ enum tick_template { TICK_WWV, TICK_WWVH, TICK_BPM, TICK_NTEMPLATES };
 // Most profile values any accepted sample rate needs: 70 ms of lags at the
 // step nearest 0.1 ms is at most 980 values (14 kHz, step 1)
 #define TICK_MAX_PROFILE 1050
-#define TICK_ENVELOPE 1000   // envelope values per second (1 kHz)
-#define TICK_MARKERS 3       // marker tones 1000, 1200, 1500 Hz
+#define TICK_ENVELOPE_LEN 1000   // envelope values per second (1 kHz)
+#define TICK_MARKER_TONES 3       // marker tones 1000, 1200, 1500 Hz
 
 struct tick_config {
   int samprate;        // channel output rate; a multiple of 1000, at least 4000
@@ -37,8 +37,8 @@ struct tick_second {                 // one report
   float complex profile[TICK_NTEMPLATES][TICK_MAX_PROFILE];
   double peak_index[TICK_NTEMPLATES];   // channel-output counter, fractional (parabolic on |profile|)
   double peak_snr_db[TICK_NTEMPLATES];
-  double marker_energy[TICK_MARKERS];   // 1000, 1200, 1500 Hz over 0-800 ms
-  int16_t envelope[TICK_ENVELOPE]; float envelope_scale;
+  double marker_energy[TICK_MARKER_TONES];   // 1000, 1200, 1500 Hz over 0-800 ms
+  int16_t envelope[TICK_ENVELOPE_LEN]; float envelope_scale;
   bool complete;                     // false if the window was not fully covered
 };
 

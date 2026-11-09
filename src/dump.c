@@ -511,6 +511,41 @@ void dump_metadata(FILE *fp,uint8_t const * const buffer,size_t length,bool newl
       for(int i=0; i + 4 <= optlen && i < 32; i += 4)
         fprintf(fp," %.6g",decode_float(cp+i,4));
       break;
+    case TICK_SECOND_UTC:
+      fprintf(fp,"tick second utc %lld ns since GPS epoch",(long long)decode_int64(cp,optlen));
+      break;
+    case TICK_WINDOW_START:
+      fprintf(fp,"tick window start input sample %lld",(long long)decode_int64(cp,optlen));
+      break;
+    case TICK_STEP:
+      fprintf(fp,"tick step %d input samples",decode_int(cp,optlen));
+      break;
+    case TICK_FLAGS:
+      {
+        int const f = decode_int(cp,optlen);
+        fprintf(fp,"tick flags 0x%x (complete %d, used pilot %d, templates 0x%x)",f,f & 1,(f >> 1) & 1,(f >> 4) & 7);
+      }
+      break;
+    case TICK_PROFILE_WWV:
+    case TICK_PROFILE_WWVH:
+    case TICK_PROFILE_BPM:
+      fprintf(fp,"tick %s profile: scale %.6g, %d complex values",
+              type == TICK_PROFILE_WWV ? "wwv" : type == TICK_PROFILE_WWVH ? "wwvh" : "bpm",
+              optlen >= 4 ? decode_float(cp,4) : 0.0,optlen >= 4 ? (optlen - 4) / 4 : 0);
+      break;
+    case TICK_PEAKS:
+      fprintf(fp,"tick peaks [wwv, wwvh, bpm offset input samples; snr dB] =");
+      for(int i=0; i + 4 <= optlen && i < 24; i += 4)
+        fprintf(fp," %.6g",decode_float(cp+i,4));
+      break;
+    case TICK_MARKERS:
+      fprintf(fp,"tick marker energy [1000, 1200, 1500 Hz] =");
+      for(int i=0; i + 4 <= optlen && i < 12; i += 4)
+        fprintf(fp," %.6g",decode_float(cp+i,4));
+      break;
+    case TICK_ENVELOPE:
+      fprintf(fp,"tick envelope: scale %.6g, %d values",optlen >= 4 ? decode_float(cp,4) : 0.0,optlen >= 4 ? (optlen - 4) / 2 : 0);
+      break;
     default:
       fprintf(fp,"unknown type %d length %d",type,optlen);
       break;

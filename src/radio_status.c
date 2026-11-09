@@ -20,6 +20,7 @@
 #include "misc.h"
 #include "radio.h"
 #include "pilot_status.h"
+#include "tick_status.h"
 #include "filter.h"
 #include "multicast.h"
 #include "status.h"
@@ -770,6 +771,15 @@ static unsigned long encode_radio_status(struct frontend const * const frontend,
     uint64_t const anchor_epoch = chan->anchor.epoch;
     struct pilot_report const last = chan->pilot.last;
     encode_pilot_status(&bp,anchor_epoch,anchor_rtp,anchor_sample,&last);
+    // Tick group (tick_chan.c). Same thread rule: chan->ticks is written only by this channel's
+    // demod thread, which is the thread that runs this (response() is called from the demod loop
+    // and handle_commands; the radio_status thread passes chan == NULL and never gets here),
+    // so chan->ticks.last is read without a lock. last is NULL while ticks are off.
+    // Rule, as for pilot: send the group only when the report's epoch equals the INPUT_EPOCH just
+    // sent (the anchor's), so its input-counter positions pair with the anchor in the same packet
+    if(chan->ticks.last != NULL && chan->ticks.last_valid && chan->ticks.last_epoch == anchor_epoch)
+      encode_tick_status(&bp,chan->ticks.last,chan->ticks.last_second_utc_ns,chan->ticks.used_pilot,
+                         chan->ticks.templates,chan->ticks.base_input,chan->ticks.decim);
   }
   // Tuning
   encode_double(&bp,RADIO_FREQUENCY,chan->tune.freq); // Hz

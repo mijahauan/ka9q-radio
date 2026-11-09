@@ -181,6 +181,17 @@ enum status_type {
   PILOT_FOLD_COUNT = 230,    // int, seconds folded
   PILOT_FILTER_DELAY = 229,  // double, channel filter group delay, seconds
   PILOT_BATTERY = 228,       // vector of 8 floats
+  // Time-station tick detector (tick_status.c), one group per second per tick channel
+  TICK_SECOND_UTC = 227,     // int64, the UTC second measured, ns since GPS epoch
+  TICK_WINDOW_START = 226,   // int64, input-counter index of the profile window's first sample
+  TICK_STEP = 225,           // int, input samples per profile step
+  TICK_FLAGS = 224,          // int, bit0 complete, bit1 used_pilot, bits 4-6 template mask
+  TICK_PROFILE_WWV = 223,    // vector: float scale, then int16 re,im pairs (bytes, big endian)
+  TICK_PROFILE_WWVH = 222,   // same
+  TICK_PROFILE_BPM = 221,    // same
+  TICK_PEAKS = 220,          // vector of 6 floats: per template (wwv, wwvh, bpm) peak offset from window start, input samples (NaN: none), then SNR dB
+  TICK_MARKERS = 219,        // vector of 3 floats: energy at 1000, 1200, 1500 Hz
+  TICK_ENVELOPE = 218,       // vector: float scale, then 1000 int16
 };
 
 /**

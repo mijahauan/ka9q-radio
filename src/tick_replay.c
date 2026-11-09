@@ -77,7 +77,7 @@ int main(int argc,char *argv[]){
       printf("\"marker_energy\": [%.17g, %.17g, %.17g], ",
              r.marker_energy[0],r.marker_energy[1],r.marker_energy[2]);
       printf("\"envelope\": [");
-      for(int i=0; i < TICK_ENVELOPE; i++)
+      for(int i=0; i < TICK_ENVELOPE_LEN; i++)
         printf("%s%d",i ? ", " : "",r.envelope[i]);
       printf("], \"envelope_scale\": %.9g, \"complete\": %s}\n",
              r.envelope_scale,r.complete ? "true" : "false");

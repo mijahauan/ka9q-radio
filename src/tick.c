@@ -43,7 +43,7 @@
 static double const Tmpl_hz[TICK_NTEMPLATES] = {1000, 1200, 1000};
 static double const Tmpl_cycles[TICK_NTEMPLATES] = {5, 6, 10};
 static char const * const Tmpl_name[TICK_NTEMPLATES] = {"wwv", "wwvh", "bpm"};
-static double const Marker_hz[TICK_MARKERS] = {1000, 1200, 1500};
+static double const Marker_hz[TICK_MARKER_TONES] = {1000, 1200, 1500};
 
 struct tick_state {
   struct tick_config cfg;
@@ -136,7 +136,7 @@ struct tick_state *tick_create(struct tick_config const *cfg){
   int e = t->win_off + (t->nprofile - 1) * t->step + maxlen;
   if(t->marker_n > e)
     e = t->marker_n;
-  int const env_last = (TICK_ENVELOPE - 1) * t->decim + t->env_half + 1;
+  int const env_last = (TICK_ENVELOPE_LEN - 1) * t->decim + t->env_half + 1;
   if(env_last > e)
     e = env_last;
   t->span_end = e;
@@ -282,7 +282,7 @@ static void do_template(struct tick_state *t,int k,int64_t window_start,struct t
 static void do_markers(struct tick_state const *t,struct tick_second *out){
   float complex const *x = t->lin - t->span_begin; // nominal second
   int const N = t->marker_n;
-  for(int m=0; m < TICK_MARKERS; m++){
+  for(int m=0; m < TICK_MARKER_TONES; m++){
     double const w = 2*M_PI*Marker_hz[m] / t->cfg.samprate;
     double const coeff = 2 * cos(w);
     double complex s1 = 0, s2 = 0;
@@ -300,10 +300,10 @@ static void do_markers(struct tick_state const *t,struct tick_second *out){
 
 static void do_envelope(struct tick_state const *t,struct tick_second *out){
   float const * const m = t->mag - t->span_begin; // nominal second
-  _Static_assert(TICK_ENVELOPE == ENV_RATE,"envelope is one second at 1 kHz");
-  double env[TICK_ENVELOPE];
+  _Static_assert(TICK_ENVELOPE_LEN == ENV_RATE,"envelope is one second at 1 kHz");
+  double env[TICK_ENVELOPE_LEN];
   double big = 0;
-  for(int i=0; i < TICK_ENVELOPE; i++){
+  for(int i=0; i < TICK_ENVELOPE_LEN; i++){
     float const *x = m + i * t->decim - t->env_half;
     double acc = 0;
     for(int k=0; k < t->env_ntaps; k++)
@@ -319,7 +319,7 @@ static void do_envelope(struct tick_state const *t,struct tick_second *out){
   }
   float const scale = (float)(big / 32767);
   out->envelope_scale = scale;
-  for(int i=0; i < TICK_ENVELOPE; i++){
+  for(int i=0; i < TICK_ENVELOPE_LEN; i++){
     long q = lrint(env[i] / scale);
     if(q > 32767)
       q = 32767;
