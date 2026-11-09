@@ -27,7 +27,7 @@
 #include "timing.h"
 #include "defaults.h"
 
-static unsigned long encode_radio_status(struct frontend const *frontend,chan_t const *chan,uint8_t *packet, unsigned long len);
+static unsigned long encode_radio_status(struct frontend const *frontend,chan_t const *chan,uint8_t *packet, unsigned long len,bool tick_due);
 
 // Radio status reception and transmission thread
 void *radio_status(void *arg){
@@ -127,7 +127,22 @@ int send_radio_status(struct sockaddr const * const sock, struct frontend const 
   }
   socklen_t const slen = sock->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
   uint8_t packet[PKTSIZE];
-  unsigned long const len = encode_radio_status(frontend, chan, packet, sizeof packet);
+  // Tick group (tick_chan.c), each report once per destination. Threads: chan->ticks is written only
+  // by this channel's demod thread, which is also the only one that calls here with chan != NULL
+  // (response(); the radio_status thread passes NULL), so ticks.last needs no lock and ticks.last_seq /
+  // sent_seq need no atomics. Epoch rule, as for pilot: send only when the report's epoch equals the
+  // INPUT_EPOCH this packet carries (the anchor's), so its input-counter positions pair with the anchor.
+  // Destinations: 0 = the metadata socket (polls and their answers), 1 = the channel's output stream
+  // (periodic status). A report goes to each at most once; whichever packet reaches a destination first
+  // after the report completes carries it
+  bool tick_due = false;
+  int tick_dest = 0;
+  if(chan != NULL && chan->demod_type == LINEAR_DEMOD && chan->anchor.seen && chan->ticks.last != NULL
+     && chan->ticks.last_valid && chan->ticks.last_epoch == chan->anchor.epoch){
+    tick_dest = (sock == (struct sockaddr const *)&chan->status.dest_socket) ? 1 : 0;
+    tick_due = tick_status_take(chan->ticks.last_seq,&chan->ticks.sent_seq[tick_dest]); // marks it sent
+  }
+  unsigned long const len = encode_radio_status(frontend, chan, packet, sizeof packet, tick_due);
   if(sendto(out_fd,packet,len,0,sock, slen) < 0 && chan != NULL){
     if(Verbose)
       fprintf(stderr,"%s: error sending status: %s\n",chan->name,strerror(errno));
@@ -708,7 +723,7 @@ bool is_poll(uint8_t const * const buffer,int const length){
 // Encode contents of frontend and chan structures as command or status packet
 // packet argument must be long enough!!
 // Convert values from internal to engineering units
-static unsigned long encode_radio_status(struct frontend const * const frontend,chan_t const * const chan,uint8_t * const packet, unsigned long const len){
+static unsigned long encode_radio_status(struct frontend const * const frontend,chan_t const * const chan,uint8_t * const packet, unsigned long const len,bool const tick_due){
   uint8_t *bp = packet;
   *bp++ = STATUS; // 0 = status, 1 = command
   // Now used as channel ID, so present in all modes
@@ -771,15 +786,6 @@ static unsigned long encode_radio_status(struct frontend const * const frontend,
     uint64_t const anchor_epoch = chan->anchor.epoch;
     struct pilot_report const last = chan->pilot.last;
     encode_pilot_status(&bp,anchor_epoch,anchor_rtp,anchor_sample,&last);
-    // Tick group (tick_chan.c). Same thread rule: chan->ticks is written only by this channel's
-    // demod thread, which is the thread that runs this (response() is called from the demod loop
-    // and handle_commands; the radio_status thread passes chan == NULL and never gets here),
-    // so chan->ticks.last is read without a lock. last is NULL while ticks are off.
-    // Rule, as for pilot: send the group only when the report's epoch equals the INPUT_EPOCH just
-    // sent (the anchor's), so its input-counter positions pair with the anchor in the same packet
-    if(chan->ticks.last != NULL && chan->ticks.last_valid && chan->ticks.last_epoch == anchor_epoch)
-      encode_tick_status(&bp,chan->ticks.last,chan->ticks.last_second_utc_ns,chan->ticks.used_pilot,
-                         chan->ticks.templates,chan->ticks.base_input,chan->ticks.decim);
   }
   // Tuning
   encode_double(&bp,RADIO_FREQUENCY,chan->tune.freq); // Hz
@@ -951,6 +957,13 @@ static unsigned long encode_radio_status(struct frontend const * const frontend,
     encode_float(&bp,TP2,chan->tp2);
   encode_int64(&bp,SETOPTS,chan->options);
   encode_int64(&bp,OUTPUT_ERRORS,chan->output.errors);
+  // The tick group is ~12 KB, so it goes LAST: ka9q-python clients read with recvfrom(8192), and a
+  // truncated datagram must lose only tick data, never RADIO_FREQUENCY, preset and the rest.
+  // ka9q-python's decoder (ka9q/status.py, `if cp + optlen > n: break`) stops cleanly on a
+  // truncated final TLV. tick_due was decided in send_radio_status (once per report per destination)
+  if(tick_due)
+    encode_tick_status(&bp,chan->ticks.last,chan->ticks.last_second_utc_ns,chan->ticks.used_pilot,
+                       chan->ticks.templates,chan->ticks.base_input,chan->ticks.decim);
  done:;
   encode_eol(&bp);
   if(bp < packet + len)

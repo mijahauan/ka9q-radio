@@ -119,6 +119,7 @@ void tick_on_block(chan_t * const chan,bool const straddle){
   if(r != 1)
     return;
   chan->ticks.last_valid = true;
+  chan->ticks.last_seq++;
   chan->ticks.last_epoch = meta.epoch;
   chan->ticks.last_second_utc_ns = meta.second_utc_ns;
   chan->ticks.used_pilot = meta.used_pilot;

@@ -517,6 +517,39 @@ static void test_report_cost(void){
 
 // A filled report through encode_tick_status and decode_tick_status: every
 // field comes back, and the packet stays inside what one datagram holds
+// Accepted size of one tick group with three 840-value profiles and the envelope
+// (measured 12,176 bytes; three int16-pair profiles are 10 KB alone). Above the
+// 9 KB first hoped for; the group is sent last in the packet for that reason
+#define TICK_GROUP_BYTES_ACCEPTED 12500
+
+static void decode_group(struct tick_status *d,uint8_t const *cp,uint8_t const *end){
+  while(cp < end){
+    int const type = *cp++;
+    int optlen = *cp++;
+    if(optlen & 0x80){
+      int const n = optlen & 0x7f;
+      optlen = 0;
+      for(int i=0; i < n; i++)
+        optlen = (optlen << 8) | *cp++;
+    }
+    assert(decode_tick_status(d,(enum status_type)type,cp,optlen));
+    cp += optlen;
+  }
+}
+
+static void test_tick_once_only(void){
+  uint64_t sent[2] = {0,0};
+  assert(!tick_status_take(0,&sent[0]));          // no report yet
+  assert(tick_status_take(1,&sent[0]));           // first packet carries report 1
+  assert(!tick_status_take(1,&sent[0]));          // later packets do not
+  assert(!tick_status_take(1,&sent[0]));
+  assert(tick_status_take(1,&sent[1]));           // the other destination still gets it once
+  assert(!tick_status_take(1,&sent[1]));
+  assert(tick_status_take(2,&sent[0]));           // a new report goes out again
+  assert(tick_status_take(3,&sent[0]));           // a skipped number is fine
+  printf("test_tick_once_only passed\n");
+}
+
 static void test_tick_tlv_roundtrip(void){
   struct tick_second *s = calloc(1,sizeof(*s));
   struct tick_status *d = calloc(1,sizeof(*d));
@@ -541,27 +574,21 @@ static void test_tick_tlv_roundtrip(void){
   encode_tick_status(&bp,s,1700000000000000000LL,true,7,base,decim);
   size_t const len = bp - pkt;
   printf("  tick group %zu bytes (three profiles of %d, envelope)\n",len,s->nprofile);
-  assert(len < 13000); // ~12.2 KB: over the 9 KB hoped for, since three 840-value int16 pairs are 10 KB alone; PKTSIZE is 64 KB
+  assert(len < TICK_GROUP_BYTES_ACCEPTED);
 
-  uint8_t const *cp = pkt;
-  while(cp < bp){
-    int const type = *cp++;
-    int optlen = *cp++;
-    if(optlen & 0x80){
-      int const n = optlen & 0x7f;
-      optlen = 0;
-      for(int i=0; i < n; i++)
-        optlen = (optlen << 8) | *cp++;
-    }
-    assert(decode_tick_status(d,(enum status_type)type,cp,optlen));
-    cp += optlen;
-  }
+  decode_group(d,pkt,bp);
   assert(d->valid && d->second_utc_ns == 1700000000000000000LL);
   assert(d->window_start_input == base + (int64_t)s->window_start_index * decim);
   assert(d->step_input == 2 * decim);
   assert(d->complete && d->used_pilot && d->templates == 7);
   for(int k=0; k < TICK_NTEMPLATES; k++){
     assert(d->nprofile[k] == 840);
+    float want = 0;   // the transmitted scale is the largest |re| or |im| of the profile
+    for(int i=0; i < 840; i++){
+      want = fmaxf(want,fabsf(crealf(s->profile[k][i])));
+      want = fmaxf(want,fabsf(cimagf(s->profile[k][i])));
+    }
+    assert(d->profile_scale[k] == want);
     float const tol = d->profile_scale[k] / 32767.0f * 1.01f;
     for(int i=0; i < 840; i++){
       assert(fabsf(crealf(d->profile[k][i]) - crealf(s->profile[k][i])) <= tol);
@@ -584,23 +611,26 @@ static void test_tick_tlv_roundtrip(void){
   bp = pkt;
   encode_tick_status(&bp,s,1700000001000000000LL,false,1u << TICK_WWV,base,decim);
   memset(d,0,sizeof(*d));
-  cp = pkt;
-  while(cp < bp){
-    int const type = *cp++;
-    int optlen = *cp++;
-    if(optlen & 0x80){
-      int const n = optlen & 0x7f;
-      optlen = 0;
-      for(int i=0; i < n; i++)
-        optlen = (optlen << 8) | *cp++;
-    }
-    assert(decode_tick_status(d,(enum status_type)type,cp,optlen));
-    cp += optlen;
-  }
+  decode_group(d,pkt,bp);
   assert(d->valid && !d->complete && !d->used_pilot && d->templates == 1);
   assert(d->nprofile[TICK_WWV] == 840 && d->nprofile[TICK_WWVH] == 0);
   assert(maxmag(d->profile[TICK_WWV],840) == 0);
   assert(d->have_peaks && isnan(d->peak_offset[TICK_WWV]) && isnan(d->peak_offset[TICK_WWVH]));
+  // A non-contiguous mask (wwv + bpm): wwvh's slot stays empty, its peak NaN
+  s->complete = true;
+  for(int i=0; i < 840; i++)
+    s->profile[TICK_WWV][i] = s->profile[TICK_BPM][i] = (float)i - 400.0f + I * 3.0f;
+  s->profile[TICK_WWV][5] = NAN;            // a non-finite value must not poison the scale
+  for(int k=0; k < TICK_NTEMPLATES; k++){ s->peak_index[k] = s->window_start_index + 10; s->peak_snr_db[k] = 9; }
+  bp = pkt;
+  encode_tick_status(&bp,s,1700000002000000000LL,false,5,base,decim);
+  memset(d,0,sizeof(*d));
+  decode_group(d,pkt,bp);
+  assert(d->templates == 5 && d->nprofile[TICK_WWV] == 840 && d->nprofile[TICK_BPM] == 840);
+  assert(d->nprofile[TICK_WWVH] == 0);
+  assert(isfinite(d->profile_scale[TICK_WWV]) && d->profile_scale[TICK_WWV] == 439.0f);
+  assert(crealf(d->profile[TICK_WWV][5]) == 0);
+  assert(isnan(d->peak_offset[TICK_WWVH]) && d->peak_offset[TICK_BPM] == 10.0f * decim);
   free(s); free(d);
   printf("test_tick_tlv_roundtrip passed\n");
 }
@@ -622,6 +652,7 @@ int main(void){
   test_pilot_slot();
   test_report_cost();
   test_tick_tlv_roundtrip();
+  test_tick_once_only();
   printf("all tick tests passed\n");
   exit(0);
 }

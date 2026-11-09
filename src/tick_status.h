@@ -41,4 +41,14 @@ void encode_tick_status(uint8_t **bp, struct tick_second const *s, int64_t secon
 // Decode one TLV into *ts (zero it before the first). True when type was one of ours
 bool decode_tick_status(struct tick_status *ts, enum status_type type, uint8_t const *cp, int optlen);
 
+// Once-only rule: true the first time report number last_seq (counted from 1; 0 = no
+// report) is asked about for the destination whose last-sent number is *sent_seq, and
+// records it; false for the same report afterwards
+static inline bool tick_status_take(uint64_t last_seq,uint64_t *sent_seq){
+  if(last_seq == 0 || last_seq == *sent_seq)
+    return false;
+  *sent_seq = last_seq;
+  return true;
+}
+
 #endif

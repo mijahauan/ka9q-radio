@@ -9,14 +9,16 @@
 // scale (float, big endian) then n int16 values, big endian. Scale is the
 // largest magnitude, so values use the full int16 range and the quantisation
 // error is at most scale/65534. Returns the byte count
-static size_t pack_scaled(uint8_t *out,float const *v,int n,float scale){
+static size_t pack_scaled(uint8_t *out,float const *v,int n,float scale){ // non-finite scale or value: sent as 0
+  if(!isfinite(scale))
+    scale = 0;
   uint32_t u;
   memcpy(&u,&scale,sizeof u);
   for(int i=0; i < 4; i++)
     out[i] = (uint8_t)(u >> (24 - 8*i));
   uint8_t *cp = out + 4;
   for(int i=0; i < n; i++){
-    long q = scale > 0 ? lrintf(v[i] / scale * 32767.0f) : 0;
+    long q = scale > 0 && isfinite(v[i]) ? lrintf(v[i] / scale * 32767.0f) : 0;
     if(q > 32767) q = 32767;
     if(q < -32767) q = -32767;
     *cp++ = (uint8_t)((uint16_t)q >> 8);
@@ -28,7 +30,7 @@ static size_t pack_scaled(uint8_t *out,float const *v,int n,float scale){
 static float max_abs(float const *v,int n){
   float m = 0;
   for(int i=0; i < n; i++)
-    if(fabsf(v[i]) > m)
+    if(isfinite(v[i]) && fabsf(v[i]) > m)
       m = fabsf(v[i]);
   return m;
 }

@@ -351,6 +351,8 @@ struct channel {
     bool used_pilot;             // that second was named from a pilot report, not the host clock
     int64_t base_input;          // input index of output counter 0 (pilot_out_to_input's block_input_index)
     int decim;                   // input samples per output sample
+    uint64_t last_seq;           // counts reports; 0 = none yet
+    uint64_t sent_seq[2];        // last_seq last sent to [0] the metadata socket, [1] the output stream
   } ticks;
   // RTP timestamp and input sample index of the current block's first sample (linear demod)
   struct {
