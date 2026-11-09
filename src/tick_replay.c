@@ -58,8 +58,8 @@ int main(int argc,char *argv[]){
       exit(1);
     }
     if(ret == 1){
-      printf("{\"window_start_index\": %lld, \"step\": %d, \"nprofile\": %d, ",
-             (long long)r.window_start_index,r.step,r.nprofile);
+      printf("{\"second_index\": %lld, \"window_start_index\": %lld, \"step\": %d, \"nprofile\": %d, ",
+             (long long)r.second_index,(long long)r.window_start_index,r.step,r.nprofile);
       for(int k=0; k < TICK_NTEMPLATES; k++){
         if(!(cfg.templates & (1u << k)))
           continue;

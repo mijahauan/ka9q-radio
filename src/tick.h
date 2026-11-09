@@ -21,7 +21,16 @@ struct tick_config {
   unsigned templates;  // bitmask of 1<<tick_template
 };
 
+// Where each value sits in time (all on the channel-output counter):
+// - profile[k][i] is the correlation with template k's FIRST sample at
+//   window_start_index + i*step, so peak_index marks the tick's START, not its centre
+// - envelope[i] is centred on second_index + i*samprate/1000, with no filter delay
+// - marker_energy covers [second_index, second_index + 0.8 s)
+// |profile| has lobes every half tone cycle (~0.5 ms at 1000 Hz, 0.42 ms at
+// 1200 Hz); the first sidelobe is ~0.9 of the main lobe ((L - half period)/L).
+// So peak_index is a hint: the complex profile's sign/phase resolves the lobe.
 struct tick_second {                 // one report
+  int64_t second_index;              // channel-output counter of the nominal second
   int64_t window_start_index;        // channel-output counter of the window's first sample
   int step;                          // samples per profile step
   int nprofile;                      // values per profile

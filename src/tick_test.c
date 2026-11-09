@@ -123,6 +123,7 @@ static void test_two_stations_separate(void){
     struct tick_second const *r = &Rep[i];
     assert(r->complete);
     int64_t const sec = S0 + (int64_t)i * SR;
+    assert(r->second_index == sec);
     assert(r->window_start_index == sec - 240);
     assert(r->step == 2 && r->nprofile == 840);
     double const wwv_true = sec + 4.2e-3 * SR, wwvh_true = sec + 29.0e-3 * SR;

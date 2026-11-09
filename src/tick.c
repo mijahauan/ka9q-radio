@@ -326,6 +326,7 @@ static void do_envelope(struct tick_state const *t,struct tick_second *out){
 
 static void make_report(struct tick_state *t,int64_t second,struct tick_second *out){
   int64_t const begin = second + t->span_begin;
+  out->second_index = second;
   out->window_start_index = second + t->win_off;
   out->step = t->step;
   out->nprofile = t->nprofile;
