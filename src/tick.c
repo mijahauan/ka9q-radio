@@ -180,6 +180,11 @@ void tick_reset(struct tick_state *t){
   t->last_announced = 0;
 }
 
+void tick_break(struct tick_state *t,int64_t index){
+  if(t != NULL && t->have_end && index > t->valid_from)
+    t->valid_from = index;
+}
+
 static int ring_pos(struct tick_state const *t,int64_t index){
   int64_t r = index % t->ringsize;
   if(r < 0)

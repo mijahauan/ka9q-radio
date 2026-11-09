@@ -9,7 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "tick.h"
+#include "tick_feed.h"
 
 #define SR 24000
 #define BATCH 480
@@ -262,6 +264,208 @@ static void test_gap_marks_incomplete(void){
   printf("test_gap_marks_incomplete passed\n");
 }
 
+// ---- radiod glue (tick_feed.c): naming the second, placing the window, epochs ----
+
+static void test_second_index_math(void){
+  int64_t const S = 1400000000LL * 1000000000LL;
+  // 24 kHz, reference index 1 000 000 = UTC S + 0.25 s: second S+1 sits 0.75 s later
+  int64_t const k = tick_second_index(S + 1000000000LL,1000000,S + 250000000LL,24000);
+  printf("  S+1 at index %lld\n",(long long)k);
+  assert(k == 1018000);
+  assert(tick_second_index(S,1000000,S + 250000000LL,24000) == 1000000 - 6000);
+  // A reference 100 s back, at an input rate, stays exact to the sample
+  assert(tick_second_index(S + 100000000000LL,7,S,64800000.0) == 7 + 6480000000LL);
+  printf("test_second_index_math passed\n");
+}
+
+static void test_parse_templates(void){
+  assert(tick_parse_templates("wwv") == 1u << TICK_WWV);
+  assert(tick_parse_templates("wwv+wwvh") == ((1u << TICK_WWV) | (1u << TICK_WWVH)));
+  assert(tick_parse_templates("WWV+wwvh+bpm") == 7u);
+  assert(tick_parse_templates("wwv+bpm") == ((1u << TICK_WWV) | (1u << TICK_BPM)));
+  assert(tick_parse_templates("") == 0);
+  assert(tick_parse_templates("wwv+chu") == 0);
+  assert(tick_parse_templates("wwv++wwvh") == 0);
+  assert(tick_parse_templates(NULL) == 0);
+  printf("test_parse_templates passed\n");
+}
+
+#define DECIM 4
+#define IN_SR (SR * DECIM)
+#define BASE_IN 4000000004LL           // input index of the first block
+#define UTC0 (1400000000LL * 1000000000LL) // UTC of the second at output index S0
+
+struct feed_opts {
+  int64_t ref_shift_ns;   // reference names UTC this much later than truth
+  int epoch_block;        // block where epoch 2 begins (-1: none)
+  bool straddle;          // that block straddles the loss instead
+  int pilot_from_block;   // from this block on, the reference counts as the pilot's (-1: never)
+  int64_t pilot_shift_ns; // the pilot reference's own error
+  double delay_out;       // tick channel filter delay, output samples
+};
+static struct tick_meta Meta[MAXREP];
+
+static int run_feed(struct synth const *sy,unsigned mask,int seconds,struct feed_opts const *o){
+  struct tick_config const cfg = { .samprate = SR, .templates = mask };
+  struct tick_state *t = tick_create(&cfg);
+  assert(t != NULL);
+  struct tick_feed f;
+  tick_feed_init(&f,DECIM,IN_SR,SR,o->delay_out);
+  static float complex buf[BATCH];
+  int nrep = 0;
+  int64_t const total = S0 + (int64_t)(seconds-1) * SR + tick_span_end(t) + BATCH;
+  int block = 0;
+  for(int64_t index = 0; index < total; index += BATCH, block++){
+    for(int i=0; i < BATCH; i++)
+      buf[i] = synth_sample(sy,index + i);
+    uint64_t const epoch = (o->epoch_block >= 0 && block >= o->epoch_block + (o->straddle ? 1 : 0)) ? 2 : 1;
+    bool const straddle = o->straddle && block == o->epoch_block;
+    bool const pilot = o->pilot_from_block >= 0 && block >= o->pilot_from_block;
+    // The UTC second at output index S0 enters at input BASE_IN + DECIM*S0
+    struct tick_ref const ref = {
+      .input_pos = (double)(BASE_IN + DECIM * (int64_t)S0),
+      .utc_ns = UTC0 + (pilot ? o->pilot_shift_ns : o->ref_shift_ns),
+      .epoch = epoch,
+    };
+    struct tick_second r;
+    struct tick_meta m;
+    int const ret = tick_feed_block(t,&f,buf,BATCH,BASE_IN + DECIM * index,epoch,straddle,&ref,pilot,&r,&m);
+    if(ret == 1 && nrep < MAXREP){
+      Rep[nrep] = r;
+      Meta[nrep] = m;
+      nrep++;
+    }
+  }
+  tick_destroy(t);
+  return nrep;
+}
+
+static void test_coarse_nominal_second(void){
+  struct synth sy = { .tick_ms = {3.0,0}, .tick_amp = {0.5,0}, .noise_rms = 0.01, .first_som = 10, .phase = 0.7 };
+  struct feed_opts o = { .epoch_block = -1, .pilot_from_block = -1 };
+  Rng = 1;
+  int const n0 = run_feed(&sy,1u << TICK_WWV,3,&o);
+  struct tick_second a[3];
+  struct tick_meta am[3];
+  assert(n0 >= 3);
+  memcpy(a,Rep,sizeof(a));
+  memcpy(am,Meta,sizeof(am));
+  o.ref_shift_ns = 5000000; // the reference says UTC is 5 ms later than it is
+  Rng = 1;
+  int const n1 = run_feed(&sy,1u << TICK_WWV,3,&o);
+  assert(n1 == n0);
+  for(int i=0; i < 3; i++){
+    struct tick_second const *b = &Rep[i];
+    double const truth = S0 + (double)i * SR + 3.0e-3 * SR;
+    printf("  second %d: exact ref peak %.4f, 5 ms ref peak %.4f (truth %.1f); window starts %lld vs %lld\n",
+           i,a[i].peak_index[TICK_WWV],b->peak_index[TICK_WWV],truth,
+           (long long)a[i].window_start_index,(long long)b->window_start_index);
+    assert(a[i].complete && b->complete);
+    assert(a[i].second_index == S0 + (int64_t)i * SR);
+    assert(b->second_index == a[i].second_index - 120); // 5 ms at 24 kHz
+    assert(am[i].second_utc_ns == UTC0 + (int64_t)i * 1000000000LL);
+    assert(Meta[i].second_utc_ns == am[i].second_utc_ns); // same second named
+    assert(!Meta[i].used_pilot && Meta[i].epoch == 1);
+    assert(fabs(b->peak_index[TICK_WWV] - a[i].peak_index[TICK_WWV]) < 0.01);
+    assert(fabs(a[i].peak_index[TICK_WWV] - truth) < 0.5);
+  }
+  // The tick channel's own filter delay moves the window, never the measured peak
+  o.ref_shift_ns = 0;
+  o.delay_out = 60;
+  Rng = 1;
+  assert(run_feed(&sy,1u << TICK_WWV,3,&o) >= 3);
+  assert(Rep[1].second_index == a[1].second_index + 60);
+  assert(fabs(Rep[1].peak_index[TICK_WWV] - a[1].peak_index[TICK_WWV]) < 0.01);
+  printf("test_coarse_nominal_second passed\n");
+}
+
+static void test_window_spanning_epoch_is_flagged(void){
+  struct synth sy = { .tick_ms = {3.0,0}, .tick_amp = {0.5,0}, .noise_rms = 0.01, .first_som = 10 };
+  // Second 2 starts at output S0 + 2 SR; its window runs -10..+60 ms. Block 125
+  // starts at 125*480 = 60000 = S0 + 2 SR + 0 ms; block 126 at +20 ms: inside the window
+  int const blk = (int)((S0 + 2 * SR) / BATCH) + 1;
+  for(int straddle = 0; straddle <= 1; straddle++){
+    struct feed_opts const o = { .epoch_block = blk, .straddle = straddle, .pilot_from_block = -1 };
+    Rng = 2;
+    int const n = run_feed(&sy,1u << TICK_WWV,5,&o);
+    assert(n >= 5);
+    for(int i=0; i < 5; i++)
+      printf("  %s: second %d complete %d epoch %llu peak %.3f\n",straddle ? "straddling block" : "block boundary",
+             i,Rep[i].complete,(unsigned long long)Meta[i].epoch,Rep[i].peak_index[TICK_WWV]);
+    assert(Rep[1].complete && Meta[1].epoch == 1);
+    assert(Rep[2].second_index == S0 + 2 * SR);
+    assert(!Rep[2].complete && isnan(Rep[2].peak_index[TICK_WWV]));
+    assert(Rep[3].complete && Meta[3].epoch == 2);
+    assert(Rep[4].complete && Meta[4].epoch == 2);
+  }
+  printf("test_window_spanning_epoch_is_flagged passed\n");
+}
+
+// A pilot reference arriving mid-run: the second already named on the host
+// clock keeps that alignment (tick.c's half-second rule) and says so; the
+// next second follows the pilot
+static void test_used_pilot_follows_the_named_second(void){
+  struct synth sy = { .tick_ms = {3.0,0}, .tick_amp = {0.5,0}, .noise_rms = 0.01, .first_som = 10 };
+  // Host clock 3 ms off; pilot exact, from block 60 (output 28800 = S0 + 0.7 s)
+  struct feed_opts const o = { .epoch_block = -1, .ref_shift_ns = 3000000, .pilot_from_block = 60, .pilot_shift_ns = 0 };
+  Rng = 3;
+  int const n = run_feed(&sy,1u << TICK_WWV,4,&o);
+  assert(n >= 4);
+  for(int i=0; i < 4; i++)
+    printf("  second %d: index %lld used_pilot %d utc +%lld ms\n",i,(long long)Rep[i].second_index,
+           Meta[i].used_pilot,(long long)((Meta[i].second_utc_ns - UTC0) / 1000000));
+  assert(!Meta[0].used_pilot && Rep[0].second_index == S0 - 72);
+  // Second 1 was named ~1 s ahead (S0 - 10 ms), on the host clock
+  assert(!Meta[1].used_pilot && Rep[1].second_index == S0 + SR - 72);
+  assert(Meta[2].used_pilot && Rep[2].second_index == S0 + 2 * SR);
+  assert(Meta[3].used_pilot && Meta[3].second_utc_ns == UTC0 + 3000000000LL);
+  printf("test_used_pilot_follows_the_named_second passed\n");
+}
+
+static void test_pilot_slot(void){
+  static struct tick_pilot_slot slot = TICK_PILOT_SLOT_INIT;
+  struct tick_ref r;
+  assert(!tick_slot_read(&slot,&r)); // nothing published yet
+  struct tick_ref const p = { .input_pos = 123456789012.0, .utc_ns = UTC0, .epoch = 7 };
+  tick_slot_publish(&slot,&p);
+  assert(tick_slot_read(&slot,&r));
+  assert(r.input_pos == p.input_pos && r.utc_ns == p.utc_ns && r.epoch == 7);
+  double const in = 64.8e6;
+  assert(tick_ref_fresh(&r,7,(int64_t)(p.input_pos + 119 * in),in));
+  assert(!tick_ref_fresh(&r,7,(int64_t)(p.input_pos + 121 * in),in)); // older than 120 s
+  assert(!tick_ref_fresh(&r,8,(int64_t)p.input_pos + 1000,in));      // another epoch
+  printf("test_pilot_slot passed\n");
+}
+
+// Correlation cost on this machine: three templates, markers and envelope, per second
+static void test_report_cost(void){
+  struct tick_config const cfg = { .samprate = SR, .templates = 7 };
+  struct tick_state *t = tick_create(&cfg);
+  assert(t != NULL);
+  struct synth sy = { .tick_ms = {3.0,0}, .tick_amp = {0.5,0}, .noise_rms = 0.1, .first_som = 10 };
+  int const seconds = 30;
+  int64_t const total = (int64_t)seconds * SR;
+  float complex *all = malloc(total * sizeof(*all));
+  assert(all != NULL);
+  for(int64_t i=0; i < total; i++)
+    all[i] = synth_sample(&sy,i);
+  struct timespec a,b;
+  int nrep = 0;
+  clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&a);
+  for(int64_t index = 0; index + BATCH <= total; index += BATCH){
+    struct tick_second r;
+    if(tick_process(t,all + index,BATCH,index,second_of(index),&r) == 1)
+      nrep++;
+  }
+  clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&b);
+  double const ms = ((b.tv_sec - a.tv_sec) * 1e9 + (b.tv_nsec - a.tv_nsec)) / 1e6;
+  printf("  %d reports, %.2f ms CPU per second of 24 kHz input (all three templates)\n",nrep,ms / seconds);
+  assert(nrep >= seconds - 2);
+  free(all);
+  tick_destroy(t);
+  printf("test_report_cost passed\n");
+}
+
 int main(void){
   test_two_stations_separate();
   test_absent_station_reported();
@@ -269,6 +473,13 @@ int main(void){
   test_envelope_rate();
   test_marker_energy();
   test_gap_marks_incomplete();
+  test_second_index_math();
+  test_parse_templates();
+  test_coarse_nominal_second();
+  test_window_spanning_epoch_is_flagged();
+  test_used_pilot_follows_the_named_second();
+  test_pilot_slot();
+  test_report_cost();
   printf("all tick tests passed\n");
   exit(0);
 }

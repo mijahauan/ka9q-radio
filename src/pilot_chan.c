@@ -35,6 +35,7 @@
 #include "timing.h"
 #include "pilot.h"
 #include "pilot_chan.h"
+#include "tick_chan.h"
 
 #define PILOT_SEARCH_WINDOW_MS 6.0 // hf-timestd search_window_ms
 
@@ -159,6 +160,7 @@ void pilot_chan_stop(chan_t * const chan){
   chan->pilot.worker = NULL;
   chan->pilot.det = NULL;
   chan->pilot.last.valid = false;
+  tick_chan_stop(chan);
 }
 
 // Copy the front end's valid epoch marks (see input_epoch_begin): a slot
@@ -187,12 +189,14 @@ static int read_epoch_marks(struct frontend * const frontend,struct pilot_epoch_
 // the end of each forward FFT window (filter.c:281,295), so output sample k
 // of a block responds to input around k - (M-1)/2: the edge appears
 // (M-1)/2 output samples late. Reported beside the raw edge, never subtracted
-static double filter_delay_s(chan_t const * const chan){
+double pilot_filter_delay_s(chan_t const * const chan){
   struct filter_out const * const f = &chan->filter.out;
   if(chan->output.samprate <= 0 || f->points <= f->olen)
     return 0;
   return 0.5 * (f->points - f->olen) / chan->output.samprate;
 }
+
+static void pilot_detect(chan_t *chan,int64_t sample_index,bool straddle);
 
 void pilot_on_block(chan_t * const chan){
   assert(chan != NULL);
@@ -243,6 +247,14 @@ void pilot_on_block(chan_t * const chan){
   chan->anchor.input_sample = sample_index;
   chan->anchor.epoch = epoch;
 
+  pilot_detect(chan,sample_index,straddle);
+  tick_on_block(chan,straddle);
+}
+
+// The pilot detector's share of a fresh block, after the anchor is recorded
+static void pilot_detect(chan_t * const chan,int64_t const sample_index,bool const straddle){
+  struct frontend * const frontend = chan->frontend;
+  uint64_t const epoch = chan->anchor.epoch;
   if(!chan->pilot.enable || chan->baseband == NULL || chan->sampcount <= 0)
     return;
   if(chan->pilot.worker == NULL && !pilot_chan_start(chan)){
@@ -306,5 +318,6 @@ void pilot_on_block(chan_t * const chan){
   int64_t const now_input = (int64_t)frontend->samples;
   int64_t const now_ns = gps_time_ns();
   pilot_make_report(&chan->pilot.last,&est,est_epoch,est_base,w->decim,chan->output.samprate,
-		    frontend->samprate,now_ns,now_input,filter_delay_s(chan));
+		    frontend->samprate,now_ns,now_input,pilot_filter_delay_s(chan));
+  tick_pilot_publish(&chan->pilot.last,frontend->samprate); // locked reports only
 }

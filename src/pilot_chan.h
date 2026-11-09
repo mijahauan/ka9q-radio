@@ -7,10 +7,14 @@
 // Called by demod_linear once per block, right after downconvert() returns a
 // new block and before the demod touches chan->baseband. Records chan->anchor
 // for every linear channel; with pilot.enable, also feeds the detector and
-// collects finished folds into chan->pilot.last
+// collects finished folds into chan->pilot.last; then hands the block to the
+// tick detector (tick_on_block)
 void pilot_on_block(chan_t *chan);
 // Called by demod_linear as it exits: stops the worker, frees the detector
+// (and the tick detector's, tick_chan_stop)
 void pilot_chan_stop(chan_t *chan);
+// The channel filter's group delay, seconds: (M-1)/2 output samples
+double pilot_filter_delay_s(chan_t const *chan);
 
 // Front-end drivers call this where samples go missing: a new input epoch
 // begins at input sample `start` (the next sample to arrive, i.e. the

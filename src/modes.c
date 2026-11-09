@@ -20,6 +20,7 @@
 #include "window.h"
 #include "sched.h"
 #include "defaults.h"
+#include "tick_feed.h"
 
 // Template containing compiled-in defaults and global parameters
 // Only the parameters known at compile time are specified here.
@@ -179,6 +180,7 @@ char const *Channel_keys[] = {
   "stereo",
   "threshold-extend",
   "threshold",
+  "ticks",
   "tone",
   "tone0",
   "tone1",
@@ -358,6 +360,14 @@ int loadpreset(chan_t *chan,dictionary const *table,char const *sname){
   chan->pilot.enable = config_getboolean(table,sname,"pilot",chan->pilot.enable);
   chan->pilot.fold_seconds = config_getint(table,sname,"pilot-fold",chan->pilot.fold_seconds);
   chan->pilot.snr_floor = config_getdouble(table,sname,"pilot-snr-floor",chan->pilot.snr_floor);
+  {
+    char const *cp = config_getstring(table,sname,"ticks",NULL); // HamSCI: wwv | wwv+wwvh, optional +bpm
+    if(cp){
+      chan->ticks.templates = tick_parse_templates(cp);
+      if(chan->ticks.templates == 0)
+        fprintf(stderr,"[%s] ticks = %s: want wwv, wwvh, bpm joined by +; ticks off\n",sname,cp);
+    }
+  }
   chan->linear.agc = config_getboolean(table,sname,"agc",chan->linear.agc);
   chan->fm.threshold = config_getboolean(table,sname,"extend",chan->fm.threshold); // FM threshold extension
   chan->fm.threshold = config_getboolean(table,sname,"threshold-extend",chan->fm.threshold); // FM threshold extension

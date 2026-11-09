@@ -52,6 +52,11 @@ void tick_reset(struct tick_state *t);
 int tick_process(struct tick_state *t, float complex const *s, int n, int64_t first_index,
                  int64_t second_index, struct tick_second *out);
 
+// Data before channel-output index `index` must not join data from it on (an
+// input epoch begins there): every span that begins before it reports
+// complete = false. The stream itself stays contiguous; queued seconds stay queued
+void tick_break(struct tick_state *t, int64_t index);
+
 char const *tick_template_name(enum tick_template k); // "wwv", "wwvh", "bpm"
 // Samples past the nominal second a report needs before it can complete
 int tick_span_end(struct tick_state const *t);

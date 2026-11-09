@@ -28,6 +28,7 @@
 #include "iir.h"
 #include "window.h"
 #include "pilot.h"
+#include "tick.h"
 
 char const *demod_name_from_type(enum demod_type type);
 int demod_type_from_name(char const *name);
@@ -336,6 +337,19 @@ struct channel {
     struct pilot_report last;    // latest finished fold
     uint64_t epoch_seen;
   } pilot;
+  // Time-station tick detector, linear demod only (HamSCI fork: tick.c, tick_feed.c, tick_chan.c)
+  struct {
+    unsigned templates;          // preset "ticks": mask of 1 << enum tick_template; 0 = off
+    struct tick_state *det;
+    struct tick_feed *feed;      // naming seconds and epochs, private to tick_chan.c
+    struct tick_second last;     // latest report; positions on the channel-output counter
+    bool last_valid;
+    uint64_t last_epoch;         // INPUT_EPOCH of the block that completed it
+    int64_t last_second_utc_ns;  // the UTC second it measured, ns since the GPS epoch
+    bool used_pilot;             // that second was named from a pilot report, not the host clock
+    int64_t base_input;          // input index of output counter 0 (pilot_out_to_input's block_input_index)
+    int decim;                   // input samples per output sample
+  } ticks;
   // RTP timestamp and input sample index of the current block's first sample (linear demod)
   struct {
     uint32_t rtp;
