@@ -29,3 +29,5 @@ work
 stash
 src/pilot_test
 src/pilot-replay
+src/tick_test
+src/tick-replay
